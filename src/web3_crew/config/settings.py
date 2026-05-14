@@ -14,8 +14,19 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM
-    openai_api_key: str = Field(description="OpenAI API key for CrewAI agents")
+    # LLM — Google Gemini via litellm/CrewAI
+    gemini_api_key: str = Field(description="Google Gemini API key for CrewAI agents")
+    llm_model: str = Field(
+        default="gemini/gemini-1.5-pro",
+        description=(
+            "LiteLLM-compatible model identifier. Use the 'gemini/<model>' prefix "
+            "for Google Gemini models (e.g., 'gemini/gemini-1.5-pro')."
+        ),
+    )
+    llm_temperature: float = Field(
+        default=0.2,
+        description="Sampling temperature for the LLM (0.0 = deterministic).",
+    )
 
     # Blockchain RPC
     web3_rpc_url: str = Field(

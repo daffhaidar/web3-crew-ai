@@ -2,6 +2,7 @@
 
 from crewai import Agent
 
+from web3_crew.llm import create_llm
 from web3_crew.tools.dex_screener import DexScreenerTool
 from web3_crew.tools.token_data_fetcher import TokenDataFetcherTool
 
@@ -22,6 +23,7 @@ def create_data_gatherer() -> Agent:
             "structured, providing the foundation for security analysis."
         ),
         tools=[TokenDataFetcherTool(), DexScreenerTool()],
+        llm=create_llm(),
         verbose=True,
         allow_delegation=False,
     )

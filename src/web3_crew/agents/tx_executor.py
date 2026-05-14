@@ -2,6 +2,7 @@
 
 from crewai import Agent
 
+from web3_crew.llm import create_llm
 from web3_crew.tools.safe_transaction import SafeTransactionTool
 
 
@@ -22,6 +23,7 @@ def create_tx_executor() -> Agent:
             "securely from the environment and never exposed."
         ),
         tools=[SafeTransactionTool()],
+        llm=create_llm(),
         verbose=True,
         allow_delegation=False,
     )
