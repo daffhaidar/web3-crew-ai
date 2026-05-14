@@ -58,5 +58,19 @@ class Settings(BaseSettings):
         description="Hard cap on gas limit for any transaction",
     )
 
+    # Telegram bridge (only required when running ``python -m web3_crew.telegram_bot``;
+    # the CLI entry point in ``main.py`` works without them).
+    telegram_bot_token: str = Field(
+        default="",
+        description="BotFather token for the Telegram bridge. Empty disables the bot.",
+    )
+    authorized_user_id: int = Field(
+        default=0,
+        description=(
+            "Telegram numeric user ID allowed to issue commands. Every update from "
+            "any other ID is dropped before any handler runs. 0 disables the bot."
+        ),
+    )
+
 
 settings = Settings()
