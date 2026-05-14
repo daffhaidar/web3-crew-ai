@@ -88,7 +88,7 @@ All configuration is in `.env`. See `.env.example` for available variables.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GEMINI_API_KEY` | Yes | Google Gemini API key for the LLM (used via LiteLLM) |
-| `LLM_MODEL` | No | LiteLLM model identifier (default: `gemini/gemini-1.5-pro`) |
+| `LLM_MODEL` | No | LiteLLM model identifier (default: `gemini/gemini-2.5-pro`) |
 | `LLM_TEMPERATURE` | No | Sampling temperature for the LLM (default: `0.2`) |
 | `WEB3_RPC_URL` | Yes | EVM JSON-RPC endpoint |
 | `ETHERSCAN_API_KEY` | Yes | Etherscan API key |
@@ -97,12 +97,12 @@ All configuration is in `.env`. See `.env.example` for available variables.
 
 ### LLM Provider
 
-Agents use **Google Gemini (`gemini-1.5-pro`)** by default, wired through
+Agents use **Google Gemini (`gemini-2.5-pro`)** by default, wired through
 [CrewAI](https://github.com/crewaiinc/crewai) → [LiteLLM](https://github.com/BerriAI/litellm).
 Get an API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
 and set `GEMINI_API_KEY` in your `.env`. To use a different Gemini model
 (or any other LiteLLM-supported provider), override `LLM_MODEL` — e.g.
-`gemini/gemini-1.5-flash` or `gemini/gemini-2.0-flash`.
+`gemini/gemini-2.0-flash` or `gemini/gemini-pro-latest`.
 
 ## License
 
