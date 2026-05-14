@@ -17,10 +17,12 @@ class Settings(BaseSettings):
     # LLM — Google Gemini via litellm/CrewAI
     gemini_api_key: str = Field(description="Google Gemini API key for CrewAI agents")
     llm_model: str = Field(
-        default="gemini/gemini-2.5-pro",
+        default="gemini/gemini-2.5-flash",
         description=(
             "LiteLLM-compatible model identifier. Use the 'gemini/<model>' prefix "
-            "for Google Gemini models (e.g., 'gemini/gemini-2.5-pro')."
+            "for Google Gemini models (e.g., 'gemini/gemini-2.5-flash'). "
+            "Default is 'gemini-2.5-flash' since it's available on Google's free "
+            "tier; '*-pro' models currently require a billing-enabled project."
         ),
     )
     llm_temperature: float = Field(
