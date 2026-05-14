@@ -2,6 +2,7 @@
 
 from crewai import Agent
 
+from web3_crew.llm import create_llm
 from web3_crew.tools.contract_analyzer import ContractAnalyzerTool
 from web3_crew.tools.rug_pull_detector import RugPullDetectorTool
 
@@ -23,6 +24,7 @@ def create_contract_auditor() -> Agent:
             "contracts. You always err on the side of caution."
         ),
         tools=[ContractAnalyzerTool(), RugPullDetectorTool()],
+        llm=create_llm(),
         verbose=True,
         allow_delegation=False,
     )
