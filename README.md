@@ -45,11 +45,19 @@ cp .env.example .env
 # Edit .env with your real API keys and wallet
 ```
 
-### Run
+### Run (CLI)
 
 ```bash
 uv run python -m web3_crew.main 0xYourTokenAddress --action mint
 ```
+
+### Run (Telegram bot)
+
+```bash
+uv run python -m web3_crew.telegram_bot
+```
+
+See the [Telegram Bridge](#telegram-bridge) section below for setup details.
 
 ### Lint
 
@@ -73,7 +81,9 @@ web3-crew-ai/
 ├── README.md
 ├── src/web3_crew/
 │   ├── main.py           # CLI entry point
+│   ├── telegram_bot.py   # Telegram bridge entry point
 │   ├── crew.py           # Crew orchestration
+│   ├── llm.py            # Shared LLM factory (Gemini via LiteLLM)
 │   ├── agents/           # Agent definitions
 │   ├── tasks/            # Task definitions
 │   ├── tools/            # Custom CrewAI tools
@@ -94,6 +104,8 @@ All configuration is in `.env`. See `.env.example` for available variables.
 | `ETHERSCAN_API_KEY` | Yes | Etherscan API key |
 | `WALLET_PRIVATE_KEY` | For execution | Hex-encoded private key |
 | `CHAIN_ID` | No | EVM chain ID (default: 1) |
+| `TELEGRAM_BOT_TOKEN` | For bot | BotFather token (only required to run the Telegram bridge) |
+| `AUTHORIZED_USER_ID` | For bot | Telegram numeric user ID allowed to send commands (only required to run the Telegram bridge) |
 
 ### LLM Provider
 
@@ -114,6 +126,42 @@ override `LLM_MODEL` in `.env`:
 ```dotenv
 LLM_MODEL=gemini/gemini-2.5-pro
 ```
+
+## Telegram Bridge
+
+Control the crew remotely via a Telegram bot:
+
+| Command | Pipeline | Side effect |
+|---------|----------|-------------|
+| `/start` | none | greeting + status |
+| `/check <address>` | Data Gatherer → Auditor | sends JSON risk report; **never** runs the Transaction Executor |
+| `/mint  <address>` | full pipeline | mints if audit passes, returns TxHash; rejects if risk score is too high |
+
+### OPSEC
+
+The bot enforces a single authorized Telegram user ID via a `TypeHandler`
+registered at group `-1`. Every update whose `effective_user.id` does not
+exactly match `AUTHORIZED_USER_ID` raises `ApplicationHandlerStop`, which
+terminates dispatch before any command handler is reached. Unauthorized
+senders receive **no reply** and the only side effect is a `WARNING` log
+line containing their numeric ID (never the message payload).
+
+The bot also refuses to boot when either `TELEGRAM_BOT_TOKEN` or
+`AUTHORIZED_USER_ID` is missing — fail loud, not silent.
+
+### Setup
+
+1. Talk to [@BotFather](https://t.me/BotFather) on Telegram and run
+   `/newbot`. Copy the token into `TELEGRAM_BOT_TOKEN` in your `.env`.
+2. Talk to [@userinfobot](https://t.me/userinfobot) to find your numeric
+   Telegram user ID. Put it in `AUTHORIZED_USER_ID`.
+3. Run the bot:
+
+   ```bash
+   uv run python -m web3_crew.telegram_bot
+   ```
+
+4. Message your bot `/start` to confirm it's online.
 
 ## License
 
