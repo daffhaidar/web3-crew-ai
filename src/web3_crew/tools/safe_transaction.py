@@ -19,6 +19,25 @@ block. This module:
 When ``flashbots_rpc_url`` is configured, the signed transaction is sent
 through Flashbots Protect instead of the public mempool. Reads (nonce,
 gas, balance, receipt) still go through the user's primary RPC.
+
+Defensive execution
+-------------------
+This module distinguishes four post-submit outcomes and surfaces them
+honestly to the agent (and therefore the Telegram user):
+
+  * ``success``  — mined, ``receipt.status == 1``.
+  * ``reverted`` — mined, ``receipt.status == 0``. Gas was spent.
+  * ``pending``  — not mined within ``tx_wait_seconds``. Tx still alive in
+                   the mempool; ``tx_hash`` + ``nonce`` + explorer link are
+                   returned so the user can replace or cancel.
+  * ``rejected`` — never submitted. Either the audit gate blocked it, the
+                   estimated worst-case cost exceeded ``max_tx_cost_eth``,
+                   or some validation failed.
+
+When ``enable_auto_rbf`` is true and a tx becomes ``pending``, the tool
+resubmits with a 1.5x-bumped priority fee under the same nonce, up to
+``max_rbf_attempts`` times. Every retry is re-checked against the budget
+cap so RBF can never blow past ``max_tx_cost_eth``.
 """
 
 import json
@@ -26,6 +45,7 @@ from typing import Any
 
 from crewai.tools import BaseTool
 from web3 import Web3
+from web3.exceptions import TimeExhausted
 from web3.middleware import ExtraDataToPOAMiddleware
 
 from web3_crew.config import settings
@@ -48,6 +68,24 @@ DEFAULT_PRIORITY_FALLBACK_GWEI = 2
 # 2x lets the base fee spike one full block before the tx is uncovered.
 BASE_FEE_HEADROOM = 2
 
+# Multiplier applied to priority_fee on every RBF retry attempt.
+# 1.5x is the de-facto minimum bump most pool operators require to evict
+# the original tx and accept the replacement.
+RBF_BUMP_MULTIPLIER = 1.5
+
+# Block explorer domains per chain id. Used to render a clickable
+# Etherscan-style link in pending / reverted responses so the user can
+# investigate or replace the tx without copy-pasting the hash.
+EXPLORER_DOMAINS: dict[int, str] = {
+    1: "etherscan.io",
+    11155111: "sepolia.etherscan.io",
+    137: "polygonscan.com",
+    8453: "basescan.org",
+    42161: "arbiscan.io",
+    10: "optimistic.etherscan.io",
+    56: "bscscan.com",
+}
+
 
 def compute_eip1559_fees(
     base_fee_wei: int,
@@ -65,6 +103,26 @@ def compute_eip1559_fees(
     priority_wei = min(priority_wei, priority_cap_wei)
     max_fee_wei = base_fee_wei * BASE_FEE_HEADROOM + priority_wei
     return max_fee_wei, priority_wei
+
+
+def estimate_worst_case_cost_wei(gas_limit: int, max_fee_per_gas_wei: int) -> int:
+    """Worst-case wei the wallet might pay for this transaction.
+
+    ``gas_used`` is always ``<= gas_limit`` and effective gas price is always
+    ``<= max_fee_per_gas``, so the product is a true upper bound.
+    """
+    return gas_limit * max_fee_per_gas_wei
+
+
+def explorer_tx_url(tx_hash_hex: str, chain_id: int) -> str:
+    """Block-explorer URL for a tx hash on the configured chain.
+
+    Falls back to Ethereum mainnet's Etherscan when the chain id is unknown.
+    """
+    domain = EXPLORER_DOMAINS.get(chain_id, "etherscan.io")
+    if not tx_hash_hex.startswith("0x"):
+        tx_hash_hex = "0x" + tx_hash_hex
+    return f"https://{domain}/tx/{tx_hash_hex}"
 
 
 def _build_submission_client(default_client: Web3) -> Web3:
@@ -102,7 +160,10 @@ class SafeTransactionTool(BaseTool):
         "'function_args' (list), and 'risk_score' (int). "
         "Refuses to execute if risk_score >= safety threshold. "
         "Uses EIP-1559 dynamic fees with strategy-based priority bumping "
-        "and (optionally) Flashbots Protect for anti-MEV submission."
+        "and (optionally) Flashbots Protect for anti-MEV submission. "
+        "Honest outcome reporting: success, reverted (mined but failed), "
+        "pending (stuck in mempool), or rejected (never submitted). "
+        "Pre-flight budget cap on worst-case gas cost; optional RBF retry."
     )
 
     def _run(self, tx_request: str) -> str:
@@ -171,6 +232,7 @@ class SafeTransactionTool(BaseTool):
                     account=account,
                     gas_limit=gas_limit,
                     value_wei=value_wei,
+                    function_name=function_name,
                 )
 
             try:
@@ -185,42 +247,222 @@ class SafeTransactionTool(BaseTool):
                 max_priority_fee_gwei=settings.max_priority_fee_gwei,
             )
 
-            tx = tx_builder.build_transaction({
-                "from": account.address,
-                "nonce": w3.eth.get_transaction_count(account.address),
-                "gas": gas_limit,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": priority_fee,
-                "value": value_wei,
-                "chainId": settings.chain_id,
-                "type": 2,
-            })
+            budget_wei = Web3.to_wei(settings.max_tx_cost_eth, "ether")
+            worst_case_wei = estimate_worst_case_cost_wei(gas_limit, max_fee)
+            if worst_case_wei > budget_wei:
+                return json.dumps({
+                    "status": "rejected",
+                    "reason": (
+                        f"Estimated worst-case cost "
+                        f"{Web3.from_wei(worst_case_wei, 'ether')} ETH exceeds "
+                        f"MAX_TX_COST_ETH budget {settings.max_tx_cost_eth} ETH. "
+                        f"Lower MAX_GAS_LIMIT / MAX_PRIORITY_FEE_GWEI or raise "
+                        f"MAX_TX_COST_ETH."
+                    ),
+                    "gas_limit": gas_limit,
+                    "max_fee_per_gas": max_fee,
+                    "worst_case_cost_eth": str(Web3.from_wei(worst_case_wei, "ether")),
+                    "budget_eth": settings.max_tx_cost_eth,
+                })
 
-            signed = account.sign_transaction(tx)
-
+            nonce = w3.eth.get_transaction_count(account.address)
             submit_w3 = _build_submission_client(default_client=w3)
-            tx_hash = submit_w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
-            return json.dumps({
-                "status": "success",
-                "action": function_name,
-                "tx_hash": receipt["transactionHash"].hex(),
-                "block_number": receipt["blockNumber"],
-                "gas_used": receipt["gasUsed"],
-                "effective_gas_price": receipt.get("effectiveGasPrice", 0),
-                "max_fee_per_gas": max_fee,
-                "max_priority_fee_per_gas": priority_fee,
-                "gas_strategy": settings.gas_strategy,
-                "via_flashbots": bool(settings.flashbots_rpc_url),
-                "fee_mode": "eip1559",
-            })
+            return _submit_with_rbf(
+                w3=w3,
+                submit_w3=submit_w3,
+                tx_builder=tx_builder,
+                account=account,
+                nonce=nonce,
+                gas_limit=gas_limit,
+                base_fee=base_fee,
+                max_fee=max_fee,
+                priority_fee=priority_fee,
+                value_wei=value_wei,
+                function_name=function_name,
+                budget_wei=budget_wei,
+            )
 
         except Exception as e:
             return json.dumps({
                 "status": "error",
                 "reason": _scrub_private_key(str(e)),
             })
+
+
+def _submit_with_rbf(
+    *,
+    w3: Web3,
+    submit_w3: Web3,
+    tx_builder: Any,
+    account: Any,
+    nonce: int,
+    gas_limit: int,
+    base_fee: int,
+    max_fee: int,
+    priority_fee: int,
+    value_wei: int,
+    function_name: str,
+    budget_wei: int,
+) -> str:
+    """Submit the EIP-1559 transaction; optionally retry under RBF.
+
+    All retries reuse ``nonce`` so on-chain they replace each other rather
+    than queuing. Every iteration re-runs the worst-case budget check
+    against the bumped fee — RBF can never silently push the wallet past
+    ``max_tx_cost_eth``.
+    """
+    attempts_max = settings.max_rbf_attempts if settings.enable_auto_rbf else 0
+    priority_cap_wei = Web3.to_wei(settings.max_priority_fee_gwei, "gwei")
+
+    current_max_fee = max_fee
+    current_priority = priority_fee
+    last_tx_hash_hex: str | None = None
+
+    for attempt in range(attempts_max + 1):
+        worst_case_wei = estimate_worst_case_cost_wei(gas_limit, current_max_fee)
+        if worst_case_wei > budget_wei:
+            return _pending_response(
+                last_tx_hash_hex=last_tx_hash_hex,
+                nonce=nonce,
+                reason=(
+                    f"RBF bump would exceed MAX_TX_COST_ETH "
+                    f"({settings.max_tx_cost_eth} ETH); leaving last submitted "
+                    f"tx alive in the mempool."
+                ),
+                attempts_used=attempt,
+                current_max_fee=current_max_fee,
+                current_priority=current_priority,
+            )
+
+        tx = tx_builder.build_transaction({
+            "from": account.address,
+            "nonce": nonce,
+            "gas": gas_limit,
+            "maxFeePerGas": current_max_fee,
+            "maxPriorityFeePerGas": current_priority,
+            "value": value_wei,
+            "chainId": settings.chain_id,
+            "type": 2,
+        })
+
+        signed = account.sign_transaction(tx)
+        tx_hash = submit_w3.eth.send_raw_transaction(signed.raw_transaction)
+        last_tx_hash_hex = tx_hash.hex()
+
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=settings.tx_wait_seconds
+            )
+        except TimeExhausted:
+            if attempt < attempts_max:
+                current_priority = int(current_priority * RBF_BUMP_MULTIPLIER)
+                current_priority = min(current_priority, priority_cap_wei)
+                current_max_fee = base_fee * BASE_FEE_HEADROOM + current_priority
+                continue
+            return _pending_response(
+                last_tx_hash_hex=last_tx_hash_hex,
+                nonce=nonce,
+                reason=(
+                    f"Transaction not mined within {settings.tx_wait_seconds}s. "
+                    f"It is still alive in the mempool — replace or cancel via "
+                    f"the explorer link."
+                ),
+                attempts_used=attempt + 1,
+                current_max_fee=current_max_fee,
+                current_priority=current_priority,
+            )
+
+        return _terminal_response(
+            receipt=receipt,
+            function_name=function_name,
+            max_fee=current_max_fee,
+            priority_fee=current_priority,
+            attempts_used=attempt + 1,
+            fee_mode="eip1559",
+        )
+
+    # Unreachable: loop above always returns. Defensive fallback.
+    return json.dumps({
+        "status": "error",
+        "reason": "internal: rbf loop fell through without returning",
+    })
+
+
+def _terminal_response(
+    *,
+    receipt: Any,
+    function_name: str,
+    max_fee: int,
+    priority_fee: int,
+    attempts_used: int,
+    fee_mode: str,
+) -> str:
+    """Build the JSON response for a mined transaction.
+
+    Honours ``receipt.status``: 1 → success, 0 → reverted on-chain (gas
+    was burned). The agent — and downstream Telegram user — must never see
+    ``success`` for a reverted tx; that is precisely the foot-gun this
+    function exists to close.
+    """
+    tx_hash_hex = receipt["transactionHash"].hex()
+    status_code = receipt.get("status")
+
+    common = {
+        "tx_hash": tx_hash_hex,
+        "block_number": receipt["blockNumber"],
+        "gas_used": receipt["gasUsed"],
+        "effective_gas_price": receipt.get("effectiveGasPrice", 0),
+        "max_fee_per_gas": max_fee,
+        "max_priority_fee_per_gas": priority_fee,
+        "gas_strategy": settings.gas_strategy,
+        "via_flashbots": bool(settings.flashbots_rpc_url),
+        "fee_mode": fee_mode,
+        "rbf_attempts_used": attempts_used,
+        "explorer_url": explorer_tx_url(tx_hash_hex, settings.chain_id),
+    }
+
+    if status_code == 0:
+        return json.dumps({
+            "status": "reverted",
+            "reason": (
+                "Transaction was mined but reverted on-chain. Gas was spent. "
+                "Inspect the explorer link for the revert reason."
+            ),
+            **common,
+        })
+
+    return json.dumps({
+        "status": "success",
+        "action": function_name,
+        **common,
+    })
+
+
+def _pending_response(
+    *,
+    last_tx_hash_hex: str | None,
+    nonce: int,
+    reason: str,
+    attempts_used: int,
+    current_max_fee: int,
+    current_priority: int,
+) -> str:
+    """Build the JSON response for a tx that never mined in time."""
+    payload: dict[str, Any] = {
+        "status": "pending",
+        "reason": reason,
+        "nonce": nonce,
+        "rbf_attempts_used": attempts_used,
+        "max_fee_per_gas": current_max_fee,
+        "max_priority_fee_per_gas": current_priority,
+        "gas_strategy": settings.gas_strategy,
+        "via_flashbots": bool(settings.flashbots_rpc_url),
+    }
+    if last_tx_hash_hex is not None:
+        payload["tx_hash"] = last_tx_hash_hex
+        payload["explorer_url"] = explorer_tx_url(last_tx_hash_hex, settings.chain_id)
+    return json.dumps(payload)
 
 
 def _send_legacy(
@@ -230,30 +472,71 @@ def _send_legacy(
     account: Any,
     gas_limit: int,
     value_wei: int,
+    function_name: str,
 ) -> str:
     """Fallback for chains without EIP-1559 (pre-London forks, some L2s).
 
     Uses ``gasPrice`` instead of the ``maxFeePerGas`` / ``maxPriorityFeePerGas``
-    pair so the tx remains valid on those chains.
+    pair so the tx remains valid on those chains. Honours the same budget
+    cap and reverted-receipt detection as the EIP-1559 path; RBF is not
+    implemented for legacy chains.
     """
+    gas_price = w3.eth.gas_price
+    budget_wei = Web3.to_wei(settings.max_tx_cost_eth, "ether")
+    worst_case_wei = estimate_worst_case_cost_wei(gas_limit, gas_price)
+    if worst_case_wei > budget_wei:
+        return json.dumps({
+            "status": "rejected",
+            "reason": (
+                f"Estimated worst-case cost "
+                f"{Web3.from_wei(worst_case_wei, 'ether')} ETH exceeds "
+                f"MAX_TX_COST_ETH budget {settings.max_tx_cost_eth} ETH "
+                f"(legacy gas mode)."
+            ),
+            "gas_limit": gas_limit,
+            "gas_price": gas_price,
+            "worst_case_cost_eth": str(Web3.from_wei(worst_case_wei, "ether")),
+            "budget_eth": settings.max_tx_cost_eth,
+            "fee_mode": "legacy",
+        })
+
+    nonce = w3.eth.get_transaction_count(account.address)
     tx = tx_builder.build_transaction({
         "from": account.address,
-        "nonce": w3.eth.get_transaction_count(account.address),
+        "nonce": nonce,
         "gas": gas_limit,
-        "gasPrice": w3.eth.gas_price,
+        "gasPrice": gas_price,
         "value": value_wei,
         "chainId": settings.chain_id,
     })
     signed = account.sign_transaction(tx)
     submit_w3 = _build_submission_client(default_client=w3)
     tx_hash = submit_w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-    return json.dumps({
-        "status": "success",
-        "tx_hash": receipt["transactionHash"].hex(),
-        "block_number": receipt["blockNumber"],
-        "gas_used": receipt["gasUsed"],
-        "effective_gas_price": receipt.get("effectiveGasPrice", 0),
-        "fee_mode": "legacy",
-        "via_flashbots": bool(settings.flashbots_rpc_url),
-    })
+
+    try:
+        receipt = w3.eth.wait_for_transaction_receipt(
+            tx_hash, timeout=settings.tx_wait_seconds
+        )
+    except TimeExhausted:
+        return _pending_response(
+            last_tx_hash_hex=tx_hash.hex(),
+            nonce=nonce,
+            reason=(
+                f"Transaction not mined within {settings.tx_wait_seconds}s. "
+                f"It is still alive in the mempool — replace or cancel via "
+                f"the explorer link. (RBF auto-retry is not available on "
+                f"legacy-gas chains.)"
+            ),
+            attempts_used=1,
+            current_max_fee=gas_price,
+            current_priority=0,
+        )
+
+    return _terminal_response(
+        receipt=receipt,
+        function_name=function_name,
+        max_fee=gas_price,
+        priority_fee=0,
+        attempts_used=1,
+        fee_mode="legacy",
+    )

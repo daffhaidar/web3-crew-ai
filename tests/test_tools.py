@@ -320,3 +320,161 @@ class TestFlashbotsRouting:
         assert submitter is not default
         # Submission client points at Flashbots, not the user's primary RPC.
         assert "flashbots.net" in submitter.provider.endpoint_uri
+
+
+class TestWorstCaseCost:
+    """gas_limit * max_fee_per_gas — the upper bound the wallet might pay."""
+
+    def test_formula(self):
+        from web3_crew.tools.safe_transaction import estimate_worst_case_cost_wei
+
+        # 300k gas at 100 gwei = 0.03 ETH worst case
+        cost = estimate_worst_case_cost_wei(300_000, 100 * 10**9)
+        assert cost == 300_000 * 100 * 10**9
+
+
+class TestExplorerUrl:
+    """Block-explorer link for the configured chain."""
+
+    def test_mainnet(self):
+        from web3_crew.tools.safe_transaction import explorer_tx_url
+
+        url = explorer_tx_url("0x" + "ab" * 32, chain_id=1)
+        assert url == "https://etherscan.io/tx/0x" + "ab" * 32
+
+    def test_polygon(self):
+        from web3_crew.tools.safe_transaction import explorer_tx_url
+
+        url = explorer_tx_url("0x" + "cd" * 32, chain_id=137)
+        assert "polygonscan.com" in url
+
+    def test_unknown_chain_falls_back_to_etherscan(self):
+        from web3_crew.tools.safe_transaction import explorer_tx_url
+
+        url = explorer_tx_url("0x" + "ef" * 32, chain_id=99999)
+        assert "etherscan.io" in url
+
+    def test_prepends_0x_when_missing(self):
+        from web3_crew.tools.safe_transaction import explorer_tx_url
+
+        url = explorer_tx_url("ab" * 32, chain_id=1)
+        assert "/tx/0x" + "ab" * 32 in url
+
+
+class TestTerminalResponse:
+    """Mined-tx response builder — must distinguish success from reverted."""
+
+    def _build_receipt(self, status: int):
+        # Minimal receipt shape — what the helper actually reads.
+        return {
+            "transactionHash": bytes.fromhex("ab" * 32),
+            "blockNumber": 123_456,
+            "gasUsed": 90_000,
+            "effectiveGasPrice": 50 * 10**9,
+            "status": status,
+        }
+
+    def test_status_1_returns_success(self):
+        from web3_crew.tools.safe_transaction import _terminal_response
+
+        result = json.loads(_terminal_response(
+            receipt=self._build_receipt(status=1),
+            function_name="mint",
+            max_fee=205 * 10**9,
+            priority_fee=5 * 10**9,
+            attempts_used=1,
+            fee_mode="eip1559",
+        ))
+        assert result["status"] == "success"
+        assert result["action"] == "mint"
+        assert result["tx_hash"] == "ab" * 32
+        assert result["block_number"] == 123_456
+        assert result["explorer_url"].endswith("/tx/0x" + "ab" * 32)
+
+    def test_status_0_returns_reverted(self):
+        """The exact foot-gun this PR exists to close: don't lie about success."""
+        from web3_crew.tools.safe_transaction import _terminal_response
+
+        result = json.loads(_terminal_response(
+            receipt=self._build_receipt(status=0),
+            function_name="mint",
+            max_fee=205 * 10**9,
+            priority_fee=5 * 10**9,
+            attempts_used=1,
+            fee_mode="eip1559",
+        ))
+        assert result["status"] == "reverted"
+        assert result["tx_hash"] == "ab" * 32
+        # Gas was spent — the user needs to know that explicitly.
+        assert "gas was spent" in result["reason"].lower()
+        assert result["explorer_url"].endswith("/tx/0x" + "ab" * 32)
+
+    def test_missing_status_treated_as_success(self):
+        """Pre-Byzantium fork receipts lack a status field; treat absent as success."""
+        from web3_crew.tools.safe_transaction import _terminal_response
+
+        receipt = self._build_receipt(status=1)
+        receipt.pop("status")
+        result = json.loads(_terminal_response(
+            receipt=receipt,
+            function_name="mint",
+            max_fee=205 * 10**9,
+            priority_fee=5 * 10**9,
+            attempts_used=1,
+            fee_mode="eip1559",
+        ))
+        # Absent status -> success path. (We can't tell on these chains; success
+        # is the kinder default since they predate the failure-revert era.)
+        assert result["status"] == "success"
+
+
+class TestPendingResponse:
+    """Stuck-tx response builder — must surface enough info to recover."""
+
+    def test_with_tx_hash_includes_explorer(self):
+        from web3_crew.tools.safe_transaction import _pending_response
+
+        result = json.loads(_pending_response(
+            last_tx_hash_hex="0x" + "ab" * 32,
+            nonce=42,
+            reason="timeout",
+            attempts_used=1,
+            current_max_fee=205 * 10**9,
+            current_priority=5 * 10**9,
+        ))
+        assert result["status"] == "pending"
+        assert result["tx_hash"] == "0x" + "ab" * 32
+        assert result["nonce"] == 42
+        assert result["explorer_url"].endswith("/tx/0x" + "ab" * 32)
+        assert "max_fee_per_gas" in result
+        assert "max_priority_fee_per_gas" in result
+
+    def test_without_tx_hash_omits_explorer(self):
+        """If we couldn't even submit, there's no hash to link."""
+        from web3_crew.tools.safe_transaction import _pending_response
+
+        result = json.loads(_pending_response(
+            last_tx_hash_hex=None,
+            nonce=42,
+            reason="budget exceeded on initial bump",
+            attempts_used=0,
+            current_max_fee=205 * 10**9,
+            current_priority=5 * 10**9,
+        ))
+        assert result["status"] == "pending"
+        assert "tx_hash" not in result
+        assert "explorer_url" not in result
+        assert result["nonce"] == 42
+
+
+class TestSafeTransactionToolDescriptionDefensive:
+    """The tool description is the contract surface the LLM sees."""
+
+    def test_mentions_new_outcome_types(self):
+        from web3_crew.tools.safe_transaction import SafeTransactionTool
+
+        desc = SafeTransactionTool().description.lower()
+        assert "reverted" in desc
+        assert "pending" in desc
+        assert "rejected" in desc
+        assert "budget" in desc
