@@ -106,6 +106,9 @@ All configuration is in `.env`. See `.env.example` for available variables.
 | `CHAIN_ID` | No | EVM chain ID (default: 1) |
 | `TELEGRAM_BOT_TOKEN` | For bot | BotFather token (only required to run the Telegram bridge) |
 | `AUTHORIZED_USER_ID` | For bot | Telegram numeric user ID allowed to send commands (only required to run the Telegram bridge) |
+| `GAS_STRATEGY` | No | EIP-1559 priority-fee strategy: `slow`/`standard`/`fast`/`aggressive` (default: `fast`) |
+| `MAX_PRIORITY_FEE_GWEI` | No | Hard cap on `maxPriorityFeePerGas` in gwei (default: `5`) |
+| `FLASHBOTS_RPC_URL` | No | Optional MEV-protected submission endpoint (e.g. `https://rpc.flashbots.net`) |
 
 ### LLM Provider
 
@@ -162,6 +165,40 @@ The bot also refuses to boot when either `TELEGRAM_BOT_TOKEN` or
    ```
 
 4. Message your bot `/start` to confirm it's online.
+
+## Gas War (EIP-1559) and Anti-MEV
+
+The Transaction Executor builds **EIP-1559** transactions and computes
+fees dynamically from chain state instead of using legacy `gas_price`.
+
+```
+maxPriorityFeePerGas = min(suggested_priority * strategy_multiplier,
+                           MAX_PRIORITY_FEE_GWEI)
+maxFeePerGas         = 2 * base_fee + maxPriorityFeePerGas
+```
+
+Priority fee (the tip validators see) is what wins a race for the next
+block. `MAX_PRIORITY_FEE_GWEI` is a hard cap so a volatile network can
+never drain the wallet through a runaway bid.
+
+| `GAS_STRATEGY` | Priority multiplier | When to use |
+|----------------|---------------------|-------------|
+| `slow` | 1.0x | Background approvals, non-urgent transfers |
+| `standard` | 1.5x | Regular trades on a calm network |
+| `fast` (default) | 2.0x | Default for `/mint` — aims for inclusion in the next block |
+| `aggressive` | 3.0x | Contested mints, NFT drops, time-sensitive arbitrage |
+
+If the chain doesn't expose `baseFeePerGas` (pre-London or some L2s),
+the executor falls back to a legacy `gasPrice` transaction automatically.
+
+### Anti-MEV via Flashbots Protect
+
+Set `FLASHBOTS_RPC_URL=https://rpc.flashbots.net` to broadcast signed
+transactions through Flashbots' private mempool. MEV bots scanning the
+public mempool never see the tx, so they cannot sandwich or frontrun it.
+Reads (nonce, gas estimate, balance, receipt polling) still use your
+primary `WEB3_RPC_URL`. Flashbots Protect is free, requires no auth, and
+is Ethereum mainnet only — leave the variable blank on other chains.
 
 ## License
 

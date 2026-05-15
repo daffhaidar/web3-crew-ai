@@ -191,3 +191,132 @@ class TestSafeTransactionTool:
         result = json.loads(tool._run(tx_request))
         # Should either reject for missing key or error out
         assert result["status"] in ("error", "rejected")
+
+    def test_description_mentions_eip1559_and_flashbots(self):
+        """Description is the contract surface the LLM sees; gas-war traits stay visible."""
+        from web3_crew.tools.safe_transaction import SafeTransactionTool
+
+        tool = SafeTransactionTool()
+        desc = tool.description.lower()
+        assert "eip-1559" in desc
+        assert "flashbots" in desc
+
+
+class TestEip1559FeeCalc:
+    """Strategy-driven EIP-1559 fee math. Pure function — no chain access."""
+
+    def setup_method(self):
+        from web3 import Web3
+        self.Web3 = Web3
+        # 30 gwei base fee, 2 gwei suggested priority — a calm-mainnet-ish baseline.
+        self.base = Web3.to_wei(30, "gwei")
+        self.priority = Web3.to_wei(2, "gwei")
+
+    def test_slow_uses_1x_multiplier(self):
+        from web3_crew.tools.safe_transaction import compute_eip1559_fees
+
+        _, priority = compute_eip1559_fees(self.base, self.priority, "slow", 100)
+        assert priority == self.priority  # 1.0x
+
+    def test_standard_uses_1_5x_multiplier(self):
+        from web3_crew.tools.safe_transaction import compute_eip1559_fees
+
+        _, priority = compute_eip1559_fees(self.base, self.priority, "standard", 100)
+        assert priority == int(self.priority * 1.5)
+
+    def test_fast_uses_2x_multiplier(self):
+        from web3_crew.tools.safe_transaction import compute_eip1559_fees
+
+        _, priority = compute_eip1559_fees(self.base, self.priority, "fast", 100)
+        assert priority == self.priority * 2
+
+    def test_aggressive_uses_3x_multiplier(self):
+        from web3_crew.tools.safe_transaction import compute_eip1559_fees
+
+        _, priority = compute_eip1559_fees(self.base, self.priority, "aggressive", 100)
+        assert priority == self.priority * 3
+
+    def test_unknown_strategy_falls_back_to_fast(self):
+        from web3_crew.tools.safe_transaction import compute_eip1559_fees
+
+        _, priority = compute_eip1559_fees(self.base, self.priority, "ludicrous", 100)
+        assert priority == self.priority * 2  # 'fast' is the safe default
+
+    def test_priority_fee_respects_hard_cap(self):
+        """If the strategy multiplier blows past the cap, the cap wins."""
+        from web3_crew.tools.safe_transaction import compute_eip1559_fees
+
+        # 10 gwei suggested * 3x aggressive = 30 gwei; cap at 5 gwei should clamp it.
+        _, priority = compute_eip1559_fees(
+            base_fee_wei=self.base,
+            suggested_priority_wei=self.Web3.to_wei(10, "gwei"),
+            strategy="aggressive",
+            max_priority_fee_gwei=5,
+        )
+        assert priority == self.Web3.to_wei(5, "gwei")
+
+    def test_max_fee_formula(self):
+        """maxFeePerGas = 2 * base_fee + priority_fee."""
+        from web3_crew.tools.safe_transaction import compute_eip1559_fees
+
+        max_fee, priority = compute_eip1559_fees(self.base, self.priority, "fast", 100)
+        assert max_fee == self.base * 2 + priority
+
+
+class TestPrivateKeyScrubbing:
+    """Defensive scrub: if the configured PK ever surfaces in an error, hide it."""
+
+    def test_scrubs_when_pk_present(self, monkeypatch):
+        from web3_crew.config import settings
+        from web3_crew.tools.safe_transaction import _scrub_private_key
+
+        fake_pk = "0xdeadbeef" + "00" * 30  # 0x + 64 hex chars
+        monkeypatch.setattr(settings, "wallet_private_key", fake_pk)
+        msg = f"signer blew up at {fake_pk} during build_transaction"
+        scrubbed = _scrub_private_key(msg)
+        assert fake_pk not in scrubbed
+        assert "[REDACTED]" in scrubbed
+
+    def test_noop_when_pk_absent(self, monkeypatch):
+        from web3_crew.config import settings
+        from web3_crew.tools.safe_transaction import _scrub_private_key
+
+        monkeypatch.setattr(settings, "wallet_private_key", "0x" + "ab" * 32)
+        msg = "RPC timeout after 30s"
+        assert _scrub_private_key(msg) == msg
+
+    def test_noop_when_pk_empty(self, monkeypatch):
+        """Empty PK setting must not turn arbitrary substrings into [REDACTED]."""
+        from web3_crew.config import settings
+        from web3_crew.tools.safe_transaction import _scrub_private_key
+
+        monkeypatch.setattr(settings, "wallet_private_key", "")
+        msg = "estimate_gas reverted: insufficient funds"
+        assert _scrub_private_key(msg) == msg
+
+
+class TestFlashbotsRouting:
+    """Submission client selection: primary RPC vs Flashbots Protect."""
+
+    def test_returns_same_client_when_flashbots_unset(self, monkeypatch):
+        from web3 import Web3
+
+        from web3_crew.config import settings
+        from web3_crew.tools.safe_transaction import _build_submission_client
+
+        monkeypatch.setattr(settings, "flashbots_rpc_url", "")
+        default = Web3(Web3.HTTPProvider("https://example.invalid"))
+        assert _build_submission_client(default) is default
+
+    def test_returns_new_client_when_flashbots_set(self, monkeypatch):
+        from web3 import Web3
+
+        from web3_crew.config import settings
+        from web3_crew.tools.safe_transaction import _build_submission_client
+
+        monkeypatch.setattr(settings, "flashbots_rpc_url", "https://rpc.flashbots.net")
+        default = Web3(Web3.HTTPProvider("https://example.invalid"))
+        submitter = _build_submission_client(default)
+        assert submitter is not default
+        # Submission client points at Flashbots, not the user's primary RPC.
+        assert "flashbots.net" in submitter.provider.endpoint_uri
