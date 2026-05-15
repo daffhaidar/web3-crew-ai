@@ -335,19 +335,40 @@ def _submit_with_rbf(
                 current_priority=current_priority,
             )
 
-        tx = tx_builder.build_transaction({
-            "from": account.address,
-            "nonce": nonce,
-            "gas": gas_limit,
-            "maxFeePerGas": current_max_fee,
-            "maxPriorityFeePerGas": current_priority,
-            "value": value_wei,
-            "chainId": settings.chain_id,
-            "type": 2,
-        })
+        try:
+            tx = tx_builder.build_transaction({
+                "from": account.address,
+                "nonce": nonce,
+                "gas": gas_limit,
+                "maxFeePerGas": current_max_fee,
+                "maxPriorityFeePerGas": current_priority,
+                "value": value_wei,
+                "chainId": settings.chain_id,
+                "type": 2,
+            })
+            signed = account.sign_transaction(tx)
+            tx_hash = submit_w3.eth.send_raw_transaction(signed.raw_transaction)
+        except Exception as submit_err:
+            # On RBF retries the prior submission is still alive in the
+            # mempool — never lose its hash because the replacement failed
+            # (e.g. "replacement transaction underpriced", nonce conflict,
+            # node disconnect). Surface the prior tx so the user can still
+            # cancel or replace it manually.
+            if attempt > 0 and last_tx_hash_hex is not None:
+                return _pending_response(
+                    last_tx_hash_hex=last_tx_hash_hex,
+                    nonce=nonce,
+                    reason=(
+                        f"RBF replacement attempt {attempt} failed "
+                        f"({_scrub_private_key(str(submit_err))}); previously "
+                        f"submitted tx is still alive in the mempool."
+                    ),
+                    attempts_used=attempt,
+                    current_max_fee=current_max_fee,
+                    current_priority=current_priority,
+                )
+            raise
 
-        signed = account.sign_transaction(tx)
-        tx_hash = submit_w3.eth.send_raw_transaction(signed.raw_transaction)
         last_tx_hash_hex = tx_hash.hex()
 
         try:
@@ -358,7 +379,17 @@ def _submit_with_rbf(
             if attempt < attempts_max:
                 current_priority = int(current_priority * RBF_BUMP_MULTIPLIER)
                 current_priority = min(current_priority, priority_cap_wei)
-                current_max_fee = base_fee * BASE_FEE_HEADROOM + current_priority
+                # Both maxFeePerGas AND maxPriorityFeePerGas must each rise
+                # by the node's minimum replacement bump (Geth/Nethermind
+                # require ~10%). baseFee dominates maxFeePerGas, so bumping
+                # only priority can leave the total max_fee_per_gas under
+                # the 10% threshold and the node rejects the replacement.
+                # Take the max of the base-fee-recomputed cap and a direct
+                # 1.5x bump of the previous max_fee.
+                current_max_fee = max(
+                    base_fee * BASE_FEE_HEADROOM + current_priority,
+                    int(current_max_fee * RBF_BUMP_MULTIPLIER),
+                )
                 continue
             return _pending_response(
                 last_tx_hash_hex=last_tx_hash_hex,
