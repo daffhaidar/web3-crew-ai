@@ -58,6 +58,38 @@ class Settings(BaseSettings):
         description="Hard cap on gas limit for any transaction",
     )
 
+    # Gas war — EIP-1559 dynamic fee policy
+    gas_strategy: str = Field(
+        default="fast",
+        description=(
+            "EIP-1559 priority fee strategy: 'slow' (1.0x), 'standard' (1.5x), "
+            "'fast' (2.0x), or 'aggressive' (3.0x). The multiplier is applied to "
+            "the chain's suggested priority fee from eth_maxPriorityFeePerGas, "
+            "then capped by max_priority_fee_gwei. Unknown values fall back to "
+            "'fast'."
+        ),
+    )
+    max_priority_fee_gwei: int = Field(
+        default=5,
+        description=(
+            "Hard cap (in gwei) on maxPriorityFeePerGas. Prevents runaway costs "
+            "during volatile network conditions. 5 gwei is reasonable on Ethereum "
+            "mainnet; bump higher on L2s or during NFT mints."
+        ),
+    )
+    flashbots_rpc_url: str = Field(
+        default="",
+        description=(
+            "Optional MEV-protected RPC for transaction submission. Suggested: "
+            "'https://rpc.flashbots.net' (free, no auth). When set, the signed "
+            "transaction is broadcast through Flashbots' private mempool, hiding "
+            "it from MEV bots that scan the public mempool for sandwich/frontrun "
+            "opportunities. All reads (nonce, gas, balance, receipt polling) "
+            "still go through web3_rpc_url. Mainnet-only; leave blank on other "
+            "chains."
+        ),
+    )
+
     # Telegram bridge (only required when running ``python -m web3_crew.telegram_bot``;
     # the CLI entry point in ``main.py`` works without them).
     telegram_bot_token: str = Field(
