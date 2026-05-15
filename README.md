@@ -213,7 +213,7 @@ instead of conflating mining with success:
 |----------|---------|-----------:|
 | `success`  | Mined, `receipt.status == 1` | Yes — normal gas |
 | `reverted` | Mined, `receipt.status == 0` (execution failed on-chain) | Yes — gas was burned up to the revert point |
-| `pending`  | Not mined within `TX_WAIT_SECONDS`. Tx still alive in the mempool. | No yet — but the nonce is reserved |
+| `pending`  | Not mined within `TX_WAIT_SECONDS`, or the RPC errored (rate limit / network blip) while polling for the receipt. Tx still alive in the mempool. | No yet — but the nonce is reserved |
 | `rejected` | Never submitted — audit risk too high, or worst-case cost over budget | No |
 
 `reverted` and `pending` responses include both `tx_hash` and

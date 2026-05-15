@@ -403,6 +403,26 @@ def _submit_with_rbf(
                 current_max_fee=current_max_fee,
                 current_priority=current_priority,
             )
+        except Exception as wait_err:
+            # Any non-timeout error from the receipt poller (HTTP 429 rate
+            # limit, JSON-RPC error, connection reset, DNS hiccup, etc.).
+            # The tx is ALREADY broadcast and alive in the mempool with the
+            # user's funds at stake. Never collapse this into a generic
+            # error — always surface the hash so the user can investigate,
+            # replace, or cancel.
+            return _pending_response(
+                last_tx_hash_hex=last_tx_hash_hex,
+                nonce=nonce,
+                reason=(
+                    f"RPC error while waiting for receipt "
+                    f"({_scrub_private_key(str(wait_err))}); tx is broadcast "
+                    f"and still alive in the mempool. Check the explorer "
+                    f"link, or replace/cancel via the same nonce."
+                ),
+                attempts_used=attempt + 1,
+                current_max_fee=current_max_fee,
+                current_priority=current_priority,
+            )
 
         return _terminal_response(
             receipt=receipt,
@@ -557,6 +577,23 @@ def _send_legacy(
                 f"It is still alive in the mempool — replace or cancel via "
                 f"the explorer link. (RBF auto-retry is not available on "
                 f"legacy-gas chains.)"
+            ),
+            attempts_used=1,
+            current_max_fee=gas_price,
+            current_priority=0,
+        )
+    except Exception as wait_err:
+        # RPC rate limit / connection error while polling for the receipt.
+        # The tx is already broadcast; surface its hash so the user can
+        # investigate, replace, or cancel.
+        return _pending_response(
+            last_tx_hash_hex=tx_hash.hex(),
+            nonce=nonce,
+            reason=(
+                f"RPC error while waiting for receipt "
+                f"({_scrub_private_key(str(wait_err))}); tx is broadcast "
+                f"and still alive in the mempool (legacy-gas chain). Check "
+                f"the explorer link or replace/cancel via the same nonce."
             ),
             attempts_used=1,
             current_max_fee=gas_price,

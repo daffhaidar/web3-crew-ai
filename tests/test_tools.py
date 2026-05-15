@@ -662,6 +662,73 @@ class TestRBFRetryExceptionPreservesPriorTxHash:
         # the tx is still alive in the mempool).
         assert "rbf" in result["reason"].lower() or "replacement" in result["reason"].lower()
 
+    def test_receipt_wait_rate_limit_returns_pending_not_error(
+        self, monkeypatch
+    ):
+        """RPC rate limit (or any non-TimeExhausted exception) while polling
+        for the receipt must NOT collapse to {status: error} — the tx is
+        already broadcast and the user needs the hash to recover.
+        """
+        from web3_crew.config import settings
+        from web3_crew.tools.safe_transaction import (
+            BASE_FEE_HEADROOM,
+            _submit_with_rbf,
+        )
+
+        # RBF off — we're testing the receipt-wait failure path directly.
+        monkeypatch.setattr(settings, "enable_auto_rbf", False)
+        monkeypatch.setattr(settings, "max_rbf_attempts", 0)
+        monkeypatch.setattr(settings, "tx_wait_seconds", 1)
+        monkeypatch.setattr(settings, "chain_id", 1)
+
+        base_fee = 30 * 10**9
+        priority_fee = 2 * 10**9
+        max_fee = base_fee * BASE_FEE_HEADROOM + priority_fee
+
+        broadcast_hash = bytes([0xBB]) * 32
+
+        class _RateLimitReceiptW3:
+            class eth:
+                send_calls = 0
+
+                @classmethod
+                def send_raw_transaction(cls, raw):
+                    cls.send_calls += 1
+                    return broadcast_hash
+
+                @classmethod
+                def wait_for_transaction_receipt(cls, tx_hash, timeout):
+                    raise ConnectionError("HTTP 429 Too Many Requests")
+
+        w3 = _RateLimitReceiptW3()
+
+        result = json.loads(_submit_with_rbf(
+            w3=w3,
+            submit_w3=w3,
+            tx_builder=_StubTxBuilder(),
+            account=_StubAccount(),
+            nonce=13,
+            gas_limit=200_000,
+            base_fee=base_fee,
+            max_fee=max_fee,
+            priority_fee=priority_fee,
+            value_wei=0,
+            function_name="mint",
+            budget_wei=10**18,
+        ))
+
+        # The tx WAS broadcast (send_raw_transaction returned a hash). The
+        # rate limit must be surfaced as pending-with-hash, not as a hash-less
+        # error.
+        assert result["status"] == "pending"
+        assert result["tx_hash"] == broadcast_hash.hex()
+        assert result["nonce"] == 13
+        assert result["explorer_url"].endswith("/tx/0x" + broadcast_hash.hex())
+        reason_lower = result["reason"].lower()
+        assert "rpc error" in reason_lower or "429" in reason_lower
+        # User must understand the tx is still alive.
+        assert "alive in the mempool" in reason_lower or "broadcast" in reason_lower
+
     def test_send_exception_on_first_attempt_still_errors(self, monkeypatch):
         """First-attempt send failures have no prior pending tx — keep the
         existing error pathway (don't fabricate a pending response).
