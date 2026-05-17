@@ -109,6 +109,10 @@ All configuration is in `.env`. See `.env.example` for available variables.
 | `GAS_STRATEGY` | No | EIP-1559 priority-fee strategy: `slow`/`standard`/`fast`/`aggressive` (default: `fast`) |
 | `MAX_PRIORITY_FEE_GWEI` | No | Hard cap on `maxPriorityFeePerGas` in gwei (default: `5`) |
 | `FLASHBOTS_RPC_URL` | No | Optional MEV-protected submission endpoint (e.g. `https://rpc.flashbots.net`) |
+| `MAX_TX_COST_ETH` | No | Per-tx worst-case cost cap in ETH (default: `0.05`) |
+| `TX_WAIT_SECONDS` | No | Receipt wait timeout per attempt in seconds (default: `120`) |
+| `ENABLE_AUTO_RBF` | No | Opt-in Replace-By-Fee retry on stuck tx (default: `false`) |
+| `MAX_RBF_ATTEMPTS` | No | RBF retries when enabled (default: `1`) |
 
 ### LLM Provider
 
@@ -199,6 +203,42 @@ public mempool never see the tx, so they cannot sandwich or frontrun it.
 Reads (nonce, gas estimate, balance, receipt polling) still use your
 primary `WEB3_RPC_URL`. Flashbots Protect is free, requires no auth, and
 is Ethereum mainnet only — leave the variable blank on other chains.
+
+## Defensive Execution
+
+The Transaction Executor reports **four** honest outcome statuses
+instead of conflating mining with success:
+
+| `status` | Meaning | ETH spent? |
+|----------|---------|-----------:|
+| `success`  | Mined, `receipt.status == 1` | Yes — normal gas |
+| `reverted` | Mined, `receipt.status == 0` (execution failed on-chain) | Yes — gas was burned up to the revert point |
+| `pending`  | Not mined within `TX_WAIT_SECONDS`, or the RPC errored (rate limit / network blip) while polling for the receipt. Tx still alive in the mempool. | No yet — but the nonce is reserved |
+| `rejected` | Never submitted — audit risk too high, or worst-case cost over budget | No |
+
+`reverted` and `pending` responses include both `tx_hash` and
+`explorer_url`, so the Telegram user can investigate or replace a stuck
+or failed tx in one click instead of copy-pasting hashes.
+
+### Worst-case cost budget
+
+Before signing, the executor refuses to submit any transaction whose
+`gas_limit * max_fee_per_gas` exceeds `MAX_TX_COST_ETH` (default
+`0.05` ETH). The rejection response includes `gas_limit`,
+`max_fee_per_gas`, the computed `worst_case_cost_eth`, and the active
+`budget_eth` so the user can decide whether to raise the cap or wait
+for fees to fall.
+
+### Replace-By-Fee (opt-in)
+
+When `ENABLE_AUTO_RBF=true`, a tx that is `pending` after
+`TX_WAIT_SECONDS` is resubmitted under the **same nonce** with a 1.5x
+bumped priority fee, up to `MAX_RBF_ATTEMPTS` times. Every retry is
+re-checked against `MAX_TX_COST_ETH`, so RBF can never silently push
+the wallet past the budget. If the bumped fee would blow the budget,
+the executor returns `pending` for the last-submitted tx instead of
+attempting another replacement. RBF is **off** by default to preserve
+the original conservative one-shot behaviour.
 
 ## License
 

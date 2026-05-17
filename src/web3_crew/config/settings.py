@@ -90,6 +90,44 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Defensive execution
+    max_tx_cost_eth: float = Field(
+        default=0.05,
+        description=(
+            "Per-transaction worst-case cost budget in ETH. Before signing, the "
+            "executor refuses to submit any transaction whose "
+            "gas_limit * max_fee_per_gas exceeds this value. Default 0.05 ETH "
+            "(~$150 at ETH=$3k) is a sane cap for one-off mints; raise it "
+            "deliberately for high-value drops."
+        ),
+    )
+    tx_wait_seconds: int = Field(
+        default=120,
+        description=(
+            "How long the executor waits for the transaction receipt before "
+            "treating the tx as stuck. A stuck tx is reported with status='pending' "
+            "plus tx_hash + nonce + explorer link so the user can replace or cancel."
+        ),
+    )
+    enable_auto_rbf: bool = Field(
+        default=False,
+        description=(
+            "Opt-in Replace-By-Fee: when a tx is stuck after tx_wait_seconds, "
+            "automatically resubmit the same nonce with a 1.5x bumped priority "
+            "fee, up to max_rbf_attempts times. Each retry still respects "
+            "max_priority_fee_gwei and max_tx_cost_eth so it cannot drain the "
+            "wallet. Default OFF — keep the conservative one-shot behaviour."
+        ),
+    )
+    max_rbf_attempts: int = Field(
+        default=1,
+        description=(
+            "Maximum number of Replace-By-Fee retries when enable_auto_rbf=True. "
+            "1 means: one original submission plus one bumped resubmission. "
+            "Ignored when enable_auto_rbf=False."
+        ),
+    )
+
     # Telegram bridge (only required when running ``python -m web3_crew.telegram_bot``;
     # the CLI entry point in ``main.py`` works without them).
     telegram_bot_token: str = Field(
