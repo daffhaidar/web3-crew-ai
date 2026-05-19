@@ -1,6 +1,6 @@
 ---
 name: telegram-bot-commands
-description: Reference for the Telegram bot surface — the three commands (/start, /check, /mint), the single-user auth wall, and the response shapes. Use this when adding a new command, debugging "bot doesn't reply", or explaining what each command does and does not do.
+description: Reference for the Telegram bot surface — the four commands (/start, /check, /mint, /chat), the single-user auth wall, and the response shapes. Use this when adding a new command, debugging "bot doesn't reply", or explaining what each command does and does not do.
 ---
 
 # Telegram Bot Commands
@@ -63,6 +63,24 @@ assert no command handler is called.
 - Reply always includes the auditor's risk score so the user can see why
   the mint was allowed (or refused).
 
+### `/chat <free-form text>`
+
+- Runs the **SUPERAGENT ChatAgent** (single-agent crew, completely separate
+  from the audit/mint pipeline). The ChatAgent has the SUPERAGENT persona
+  loaded from `.agents/persona/SOUL.md` + `IDENTITY.md` and uses the
+  `SkillRouterTool` to dynamically pull the relevant `SKILL.md` content for
+  the user's request.
+- Accepts any non-empty free-form text. No address validation. Skill router
+  matches keywords (English + Indonesian) against the 17-skill registry in
+  `src/web3_crew/tools/skill_router.py` and surfaces 1 PRIMARY + up to 2
+  SUPPORTING skills as reference context. The agent synthesizes the answer
+  in the user's language with SUPERAGENT tone (execute first, explain after).
+- **No on-chain side effects.** The ChatAgent has zero Web3 tools; even if
+  the LLM tried to broadcast a transaction it couldn't — there's no
+  `SafeTransactionTool` in its toolset.
+- Reply is plain HTML-escaped text (not wrapped in `<pre>`), clamped at
+  ~4000 chars.
+
 ## Response formatting
 
 All bot replies are HTML-formatted (via `html.escape` on user-controlled
@@ -103,3 +121,5 @@ boundaries and sends multiple messages. This is in `_send_long_reply()`.
 - Multi-user / role-based access (the bot is intentionally single-user;
   changing that requires a settings migration AND a new auth model)
 - Inline-button UX (the bot is command-only by design)
+- A free-form chat fallback for non-command messages (only the four named
+  commands are routed; everything else is dropped silently)

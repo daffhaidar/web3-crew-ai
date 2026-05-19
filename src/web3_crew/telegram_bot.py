@@ -8,6 +8,11 @@ Exposes the multi-agent pipeline as three strict commands:
                                      the Transaction Executor)
 * ``/mint   <contract_address>``   — full pipeline; if audit passes, the
                                      Executor mints and the TxHash is returned
+* ``/chat   <free-form text>``     — SUPERAGENT-persona general assistant;
+                                     dynamically loads SKILL.md from
+                                     ``.agents/skills/`` to answer requests
+                                     across server/monetize/content/automation/
+                                     data/API/AI/files/frontend/audit/debug
 
 OPSEC
 -----
@@ -48,7 +53,7 @@ from telegram.ext import (
 )
 
 from web3_crew.config import settings
-from web3_crew.crew import build_crew
+from web3_crew.crew import build_chat_crew, build_crew
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,10 @@ _TX_HASH_RE: Final[re.Pattern[str]] = re.compile(r"0x[a-fA-F0-9]{64}")
 # Telegram caps message bodies at 4096 characters. We reserve ~100 for the
 # surrounding ``<pre>`` tags and headers.
 _TELEGRAM_MAX_BODY: Final[int] = 3900
+
+# Plain-text replies (e.g. /chat) don't get wrapped in <pre>, so we can use a
+# slightly larger budget. Still leaves headroom below the 4096 hard limit.
+_TELEGRAM_PLAIN_MAX: Final[int] = 4000
 
 
 # ---------------------------------------------------------------------------
@@ -118,15 +127,13 @@ def _format_report(payload: str) -> str:
     return f"<pre>{html.escape(text)}</pre>"
 
 
-async def _run_crew_with_heartbeat(
+async def _run_with_heartbeat(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    token_address: str,
-    audit_only: bool,
-    action: str = "mint",
+    crew,
 ) -> str:
-    """Run a CrewAI pipeline in a worker thread while keeping the chat alive.
+    """Run any CrewAI crew in a worker thread while keeping the chat alive.
 
     CrewAI's ``kickoff()`` is synchronous and can take 30-120 seconds. We run
     it on a thread (``asyncio.to_thread``) so the bot's event loop stays free,
@@ -134,7 +141,6 @@ async def _run_crew_with_heartbeat(
     'typing…' indicator and doesn't time the conversation out.
     """
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
-    crew = build_crew(token_address=token_address, action=action, audit_only=audit_only)
 
     async def _heartbeat() -> None:
         try:
@@ -176,7 +182,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• Authorized user: <code>{settings.authorized_user_id}</code>\n\n"
         "<b>Commands</b>\n"
         "• <code>/check &lt;address&gt;</code> — audit only (no transaction)\n"
-        "• <code>/mint &lt;address&gt;</code> — audit + mint if safe"
+        "• <code>/mint &lt;address&gt;</code> — audit + mint if safe\n"
+        "• <code>/chat &lt;text&gt;</code> — ask anything (SUPERAGENT mode)"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
@@ -197,9 +204,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
     try:
-        result = await _run_crew_with_heartbeat(
-            update, context, token_address=address, audit_only=True
-        )
+        crew = build_crew(token_address=address, audit_only=True)
+        result = await _run_with_heartbeat(update, context, crew=crew)
     except Exception:
         logger.exception("Audit pipeline failed for %s", address)
         await update.message.reply_text(  # type: ignore[union-attr]
@@ -229,13 +235,8 @@ async def mint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     try:
-        result = await _run_crew_with_heartbeat(
-            update,
-            context,
-            token_address=address,
-            audit_only=False,
-            action="mint",
-        )
+        crew = build_crew(token_address=address, action="mint", audit_only=False)
+        result = await _run_with_heartbeat(update, context, crew=crew)
     except Exception:
         logger.exception("Mint pipeline failed for %s", address)
         await update.message.reply_text(  # type: ignore[union-attr]
@@ -254,6 +255,63 @@ async def mint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(  # type: ignore[union-attr]
             _format_report(result), parse_mode=ParseMode.HTML
         )
+
+
+def _format_chat_reply(payload: str) -> str:
+    """Return a plain-text Telegram body for a SUPERAGENT chat reply.
+
+    Unlike ``_format_report``, we do NOT wrap the content in ``<pre>``: the
+    chat reply is conversational, may contain its own light markdown, and the
+    user expects it to read like a human message. We still HTML-escape so the
+    Telegram parser cannot be tricked by stray ``<`` characters, and we clamp
+    to the per-message limit.
+    """
+    text = (payload or "").strip()
+    if len(text) > _TELEGRAM_PLAIN_MAX:
+        text = text[:_TELEGRAM_PLAIN_MAX] + "\n…(truncated)"
+    return html.escape(text)
+
+
+async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the SUPERAGENT-persona ChatAgent on a free-form ``/chat`` request.
+
+    Unlike ``/check`` and ``/mint``, this command:
+
+    * Accepts any non-empty free-form text (no address validation).
+    * Builds a single-agent chat crew (separate from the audit/mint pipeline).
+    * Replies in plain HTML-escaped text rather than a JSON ``<pre>`` block.
+    """
+    args = context.args or []
+    user_input = " ".join(args).strip() if args else ""
+    if not user_input:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Usage: <code>/chat &lt;free-form question&gt;</code>\n\n"
+            "Examples:\n"
+            "• <code>/chat cara setup VPS Ubuntu untuk Node.js</code>\n"
+            "• <code>/chat kenapa /mint tadi bilang reverted?</code>\n"
+            "• <code>/chat 3 cara monetize bot Telegram</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.message.reply_text(  # type: ignore[union-attr]
+        "SUPERAGENT processing… (10-30s)",
+    )
+
+    try:
+        crew = build_chat_crew(user_input)
+        result = await _run_with_heartbeat(update, context, crew=crew)
+    except Exception:
+        logger.exception("Chat pipeline failed")
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Chat pipeline failed. Check the bot logs for details.",
+        )
+        return
+
+    await update.message.reply_text(  # type: ignore[union-attr]
+        _format_chat_reply(result),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +346,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("mint", mint_command))
+    app.add_handler(CommandHandler("chat", chat_command))
 
     return app
 

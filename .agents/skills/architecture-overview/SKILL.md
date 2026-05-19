@@ -5,15 +5,24 @@ description: High-level map of the CrewAI multi-agent pipeline — agents, tasks
 
 # Architecture Overview
 
-Three specialized CrewAI agents run as a **strict sequential pipeline**.
-Each agent owns exactly one task and a bounded toolset.
+Two independent pipelines share one LLM factory but have no other coupling:
 
 ```
-   Data Gatherer  ─►  Smart Contract Auditor  ─►  Transaction Executor
-       │                       │                        │
-       ▼                       ▼                        ▼
+  Specialist pipeline (/check, /mint)
+  Data Gatherer  ─►  Smart Contract Auditor  ─►  Transaction Executor
+      │                       │                        │
+      ▼                       ▼                        ▼
   Token + DEX data       Risk score + flags        Signed tx + hash
                                                    (only if score < cap)
+
+  General pipeline (/chat)
+  ChatAgent (SUPERAGENT persona)
+      │
+      ▼
+  SkillRouterTool ─► match keywords ─► load .agents/skills/*/SKILL.md
+      │
+      ▼
+  Synthesized natural-language reply
 ```
 
 ## Pipeline data flow
@@ -38,18 +47,30 @@ Each agent owns exactly one task and a bounded toolset.
    - On audit pass: builds EIP-1559 tx, optionally routes through Flashbots
      Protect, broadcasts, waits for receipt, returns honest status.
 
+4. **ChatAgent** (`src/web3_crew/agents/chat_agent.py`) — separate pipeline
+   - Tools: `SkillRouterTool` (single tool, no Web3 access)
+   - Persona: loaded from `.agents/persona/SOUL.md` + `IDENTITY.md` into
+     `backstory`. SUPERAGENT tone: direct, tactical, execute first.
+   - Used by `/chat <text>` only. Never inherits / leaks into the specialist
+     pipeline — their agents keep their original backstories untouched.
+
 ## File map
 
 ```
 src/web3_crew/
 ├── main.py             # CLI entry point: `python -m web3_crew.main <addr>`
 ├── telegram_bot.py     # Long-running Telegram bridge entry point
-├── crew.py             # Glues agents + tasks + sequential Process
+├── crew.py             # `build_crew` (audit/mint) + `build_chat_crew` (chat)
 ├── llm.py              # Gemini-via-LiteLLM factory; shared by all agents
 ├── config/settings.py  # pydantic-settings; loads .env, validates types
-├── agents/             # CrewAI Agent definitions (role + goal + backstory)
-├── tasks/              # CrewAI Task definitions (description + expected_output)
+├── agents/             # data_gatherer + contract_auditor + tx_executor + chat_agent
+├── tasks/              # gather/audit/execute tasks + chat_task
 └── tools/              # CrewAI BaseTool subclasses; pure functions over Web3 RPC
+                       # plus skill_router (filesystem-only, no Web3 calls)
+
+.agents/
+├── skills/             # 17 SKILL.md files loaded on demand by SkillRouterTool
+└── persona/            # SOUL.md + IDENTITY.md, injected into ChatAgent only
 ```
 
 ## Conventions
@@ -76,7 +97,8 @@ src/web3_crew/
 | New on-chain data source (e.g., Tenderly simulation) | `tools/`, then bind to Data Gatherer agent |
 | New rug-pull heuristic | Extend `RugPullDetectorTool`, add unit test |
 | New on-chain action (e.g., `/sell`, `/approve`) | New task in `tasks/`, wire to Tx Executor, add `/cmd` in `telegram_bot.py` |
-| New tone / language for replies | Edit agent `backstory` field; do NOT add a SOUL.md persona layer |
+| New tone / language for replies | For specialist agents: edit their `backstory` directly. For the ChatAgent: edit `.agents/persona/SOUL.md` / `IDENTITY.md`. |
+| New free-form chat skill | Drop a `SKILL.md` with YAML frontmatter into `.agents/skills/<name>/` and add a row to `SKILL_REGISTRY` in `tools/skill_router.py`. |
 | New chain support (e.g., Base, Polygon) | `CHAIN_ID` already plumbed through settings + explorer URL builder; verify ABI is chain-agnostic |
 
 ## What this skill is NOT
