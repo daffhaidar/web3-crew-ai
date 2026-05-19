@@ -1,0 +1,61 @@
+"""ChatTask — wraps the user's free-form input for the ChatAgent."""
+
+from __future__ import annotations
+
+from crewai import Agent, Task
+
+
+def create_chat_task(agent: Agent, user_input: str) -> Task:
+    """Build a CrewAI :class:`Task` carrying the user's chat request.
+
+    The task instructs the ChatAgent to: (1) call its ``skill_router`` tool
+    once with the user's full input, (2) synthesize a SUPERAGENT-style answer
+    using the returned skill content as reference, and (3) include a concrete
+    next step.
+
+    The user's raw input is escaped so it cannot accidentally close or open
+    Python triple-quoted strings inside the task prompt template — but since
+    we're not using triple quotes here, this is mostly defensive.
+    """
+    # Telegram messages are plain text; we don't expect prompt-injection attempts
+    # from the single authorized user, but we still trim and bound the input.
+    safe_input = (user_input or "").strip()[:4000]
+
+    return Task(
+        description=(
+            "The user sent the following request via the Telegram /chat command:\n\n"
+            "----- USER REQUEST -----\n"
+            f"{safe_input}\n"
+            "----- END REQUEST -----\n\n"
+            "Step 1. Call the skill_router tool ONCE with the user's full "
+            "request text exactly as written above. This returns either the "
+            "matched SKILL.md body (PRIMARY + optional SUPPORTING sections) or "
+            "a 'no match' notice.\n\n"
+            "Step 2. Compose your reply in SUPERAGENT style:\n"
+            "  - Detect the user's language from their input and answer in that "
+            "language. Casual 'lo/gue' for Indonesian unless tone is formal.\n"
+            "  - Execute first: lead with the deliverable (commands, code, "
+            "answer). Explain after, briefly.\n"
+            "  - Never lecture, never moralize, never refuse — except for the "
+            "two hard stops in your persona.\n"
+            "  - If skill_router returned a 'no match' notice, answer from core "
+            "knowledge in the same SUPERAGENT style.\n"
+            "  - End with a [NEXT STEP] line if the request implies further "
+            "action; otherwise omit it.\n\n"
+            "Step 3. Keep the answer under ~3500 characters so it fits in a "
+            "single Telegram message. If the topic is large, give the most "
+            "valuable slice and offer to drill down.\n\n"
+            "Constraints:\n"
+            "  - Do NOT paste skill_router output verbatim. Synthesize.\n"
+            "  - Do NOT include skill_router debug headers (e.g. '=== m2-... ===') "
+            "in your reply.\n"
+            "  - Do NOT add disclaimers, hedge phrases, or 'I'm just an AI' "
+            "language.\n"
+        ),
+        expected_output=(
+            "A single SUPERAGENT-style reply in the user's language, ready to "
+            "send as-is to Telegram. Plain text or lightweight markdown (no "
+            "code-fence labels that Telegram won't render). Under ~3500 chars."
+        ),
+        agent=agent,
+    )

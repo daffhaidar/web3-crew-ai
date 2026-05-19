@@ -143,6 +143,7 @@ Control the crew remotely via a Telegram bot:
 | `/start` | none | greeting + status |
 | `/check <address>` | Data Gatherer → Auditor | sends JSON risk report; **never** runs the Transaction Executor |
 | `/mint  <address>` | full pipeline | mints if audit passes, returns TxHash; rejects if risk score is too high |
+| `/chat <text>` | ChatAgent + SkillRouter | SUPERAGENT-style general assistant; dynamically loads `.agents/skills/*/SKILL.md` to answer free-form requests (server, monetize, content, automation, data, API, AI, files, frontend, audit, strategy, debug) |
 
 ### OPSEC
 

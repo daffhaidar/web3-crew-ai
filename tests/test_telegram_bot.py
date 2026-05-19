@@ -20,13 +20,15 @@ import pytest
 from telegram import Update, User
 from telegram.ext import ApplicationHandlerStop
 
-from web3_crew.crew import build_crew
+from web3_crew.crew import build_chat_crew, build_crew
 from web3_crew.telegram_bot import (
     _ADDRESS_RE,
     _extract_address,
+    _format_chat_reply,
     _format_report,
     _gatekeeper,
     build_application,
+    chat_command,
 )
 
 AUTHORIZED_ID = 4242
@@ -220,13 +222,13 @@ class TestApplicationWiring:
         assert -1 in app.handlers
         assert any(getattr(h, "callback", None) is _gatekeeper for h in app.handlers[-1])
         commands_group = app.handlers.get(0, [])
-        # Three commands: /start, /check, /mint.
+        # Four commands: /start, /check, /mint, /chat.
         command_names = {
             cmd
             for h in commands_group
             for cmd in getattr(h, "commands", []) or []
         }
-        assert {"start", "check", "mint"}.issubset(command_names)
+        assert {"start", "check", "mint", "chat"}.issubset(command_names)
 
 
 # ---------------------------------------------------------------------------
@@ -239,3 +241,78 @@ async def test_asyncmock_smoke():
     m = AsyncMock()
     await m("ok")
     m.assert_awaited_once_with("ok")
+
+
+# ---------------------------------------------------------------------------
+# /chat command — SUPERAGENT general assistant entry point
+# ---------------------------------------------------------------------------
+
+
+class TestChatCrewShape:
+    """The chat crew must NEVER include the Transaction Executor.
+
+    Same OPSEC contract as /check: a general-assistant request must never
+    accidentally trigger an on-chain transaction.
+    """
+
+    def test_chat_crew_has_no_executor(self):
+        crew = build_chat_crew("any free-form text")
+        roles = [a.role for a in crew.agents]
+        assert "Secure Transaction Executor" not in roles
+        assert len(crew.tasks) == 1
+
+    def test_chat_crew_has_no_data_gatherer(self):
+        # Chat crew is single-agent. Adding audit agents would burn Etherscan
+        # quota on every chat turn.
+        crew = build_chat_crew("any free-form text")
+        roles = [a.role for a in crew.agents]
+        assert "Web3 Data Research Specialist" not in roles
+        assert len(crew.agents) == 1
+
+
+class TestChatReplyFormatting:
+    def test_html_escapes_user_visible_text(self):
+        out = _format_chat_reply("<script>alert(1)</script>")
+        assert "<script>" not in out
+        assert "&lt;script&gt;" in out
+
+    def test_truncates_oversized_payload(self):
+        big = "x" * 10_000
+        out = _format_chat_reply(big)
+        assert len(out) < 4200  # plain-text budget + truncation marker
+        assert "(truncated)" in out
+
+    def test_strips_leading_trailing_whitespace(self):
+        out = _format_chat_reply("   hello   ")
+        assert out == "hello"
+
+
+class TestChatCommandHandler:
+    @pytest.mark.asyncio
+    async def test_rejects_empty_args(self):
+        update = MagicMock(spec=Update)
+        update.message = MagicMock()
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+        context.args = []
+
+        await chat_command(update, context)
+
+        update.message.reply_text.assert_awaited_once()
+        body = update.message.reply_text.await_args.args[0]
+        assert "Usage" in body
+        assert "/chat" in body
+
+    @pytest.mark.asyncio
+    async def test_rejects_whitespace_only_args(self):
+        update = MagicMock(spec=Update)
+        update.message = MagicMock()
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+        context.args = ["   ", "\t"]
+
+        await chat_command(update, context)
+
+        update.message.reply_text.assert_awaited_once()
+        body = update.message.reply_text.await_args.args[0]
+        assert "Usage" in body
