@@ -14,15 +14,36 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM — Google Gemini via litellm/CrewAI
-    gemini_api_key: str = Field(description="Google Gemini API key for CrewAI agents")
-    llm_model: str = Field(
-        default="gemini/gemini-2.5-flash",
+    # LLM provider selection. Default 'gemini' (free-tier, no setup change for
+    # existing users). Set to 'cerebras' to route through Cerebras Cloud
+    # (extremely fast Llama / GPT-OSS inference, also free-tier). Switching
+    # provider only requires changing this var and supplying the matching
+    # API key — no source edits needed.
+    llm_provider: str = Field(
+        default="gemini",
         description=(
-            "LiteLLM-compatible model identifier. Use the 'gemini/<model>' prefix "
-            "for Google Gemini models (e.g., 'gemini/gemini-2.5-flash'). "
-            "Default is 'gemini-2.5-flash' since it's available on Google's free "
-            "tier; '*-pro' models currently require a billing-enabled project."
+            "LLM provider name. Supported: 'gemini' (Google AI Studio) or "
+            "'cerebras' (Cerebras Cloud). The matching *_API_KEY must be set."
+        ),
+    )
+
+    # Per-provider API keys. Only the one matching ``llm_provider`` is required
+    # at runtime; the others can stay empty.
+    gemini_api_key: str = Field(
+        default="",
+        description="Google Gemini API key (required when LLM_PROVIDER=gemini).",
+    )
+    cerebras_api_key: str = Field(
+        default="",
+        description="Cerebras Cloud API key (required when LLM_PROVIDER=cerebras).",
+    )
+
+    llm_model: str = Field(
+        default="",
+        description=(
+            "LiteLLM-compatible model identifier, e.g. 'gemini/gemini-2.5-flash' "
+            "or 'cerebras/llama3.1-8b'. Leave empty to use the provider's default "
+            "model picked by :func:`web3_crew.llm.create_llm`."
         ),
     )
     llm_temperature: float = Field(

@@ -29,7 +29,10 @@ $EDITOR .env                  # fill in secrets — see "Required env vars" belo
 
 | Variable | When required | Notes |
 |---|---|---|
-| `GEMINI_API_KEY` | Always | Free tier OK — get at https://aistudio.google.com/app/apikey |
+| `LLM_PROVIDER` | Optional | `gemini` (default) or `cerebras`. Switching is a pure env-var change. |
+| `GEMINI_API_KEY` | When `LLM_PROVIDER=gemini` | Free tier OK — get at https://aistudio.google.com/app/apikey |
+| `CEREBRAS_API_KEY` | When `LLM_PROVIDER=cerebras` | Free tier, very fast — get at https://cloud.cerebras.ai |
+| `LLM_MODEL` | Optional | Pin a specific model. Empty = factory default per provider (`gemini/gemini-2.5-flash` or `cerebras/llama3.1-8b`). |
 | `WEB3_RPC_URL` | Always | Alchemy / Infura HTTPS endpoint. Public RPC works but rate-limited. |
 | `ETHERSCAN_API_KEY` | Always (for `/check` and source fetching) | https://etherscan.io/myapikey |
 | `WALLET_PRIVATE_KEY` | Only for `/mint` (actual execution) | Hex, with or without `0x` prefix. **Burner wallet recommended.** |
@@ -39,6 +42,22 @@ $EDITOR .env                  # fill in secrets — see "Required env vars" belo
 
 Optional tuning vars (gas, RBF, budget cap): see `.env.example` for full list with
 defaults. Sane defaults ship in `src/web3_crew/config/settings.py`.
+
+### Switching LLM provider
+
+Only the *active* provider's API key is required. The other can stay empty.
+
+```bash
+# Free, fast Llama 3.1 8B on Cerebras
+LLM_PROVIDER=cerebras
+CEREBRAS_API_KEY=csk-...
+
+# Or bigger Cerebras model (slower, stronger):
+# LLM_MODEL=cerebras/gpt-oss-120b
+```
+
+The factory in `src/web3_crew/llm.py` raises a clear `ValueError` at boot if
+the matching `*_API_KEY` is missing — no silent 401s at first agent call.
 
 ## Run modes
 
