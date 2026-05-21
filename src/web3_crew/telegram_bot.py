@@ -1,35 +1,19 @@
 """Telegram bridge for the Web3 Crew AI system.
 
-Exposes the multi-agent pipeline as three strict commands:
+Exposes the multi-agent pipeline via a natural language interface:
 
-* ``/start``                       — greeting + status check
-* ``/check  <contract_address>``   — Data Gatherer → Auditor, returns the
-                                     auditor's JSON risk report (NEVER touches
-                                     the Transaction Executor)
-* ``/mint   <contract_address>``   — full pipeline; if audit passes, the
-                                     Executor mints and the TxHash is returned
-* ``/chat   <free-form text>``     — SUPERAGENT-persona general assistant;
-                                     dynamically loads SKILL.md from
-                                     ``.agents/skills/`` to answer requests
-                                     across server/monetize/content/automation/
-                                     data/API/AI/files/frontend/audit/debug
+* /start — greeting + status check (tetap dipertahankan untuk inisialisasi)
+* [Natural Text] — Secara otomatis merouting input user ke fungsi yang tepat:
+  - Jika ada kata "mint"/"hajar" + contract address -> Eksekusi MINT pipeline.
+  - Jika ada kata "cek"/"check"/"audit" + contract address -> Eksekusi AUDIT pipeline.
+  - Jika tidak ada address -> Masuk ke mode SUPERAGENT (Chat biasa).
 
 OPSEC
 -----
-The bot enforces a single authorized Telegram user ID via
-:func:`_gatekeeper`, a :class:`TypeHandler` registered at group ``-1``. Every
-update whose ``effective_user.id`` does not exactly match
-``settings.authorized_user_id`` triggers
-:class:`telegram.ext.ApplicationHandlerStop`, which terminates dispatch before
-any command handler is reached. This means:
-
-* No reply, no acknowledgement — the unauthorized sender gets silence.
-* No command parsing, no LLM/RPC/wallet code paths.
-* The only side effect is one ``WARNING`` log line containing the attacker's
-  numeric ID (never their message payload).
+The bot enforces a single authorized Telegram user ID via _gatekeeper.
+Unauthorized senders are ignored completely with no reply.
 
 Run with::
-
     uv run python -m web3_crew.telegram_bot
 """
 
@@ -48,6 +32,8 @@ from telegram.ext import (
     Application,
     ApplicationHandlerStop,
     CommandHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
     TypeHandler,
 )
@@ -57,19 +43,11 @@ from web3_crew.crew import build_chat_crew, build_crew
 
 logger = logging.getLogger(__name__)
 
-# EIP-55 / generic EVM address regex. Length is enforced; case is permissive
-# (we don't validate checksum because the auditor handles non-checksummed input).
-_ADDRESS_RE: Final[re.Pattern[str]] = re.compile(r"^0x[a-fA-F0-9]{40}$")
-
-# 32-byte transaction hash, used to surface the TxHash to the user verbatim.
+# Regex untuk mendeteksi EVM address di dalam kalimat natural.
+_ADDRESS_RE: Final[re.Pattern[str]] = re.compile(r"0x[a-fA-F0-9]{40}")
 _TX_HASH_RE: Final[re.Pattern[str]] = re.compile(r"0x[a-fA-F0-9]{64}")
 
-# Telegram caps message bodies at 4096 characters. We reserve ~100 for the
-# surrounding ``<pre>`` tags and headers.
 _TELEGRAM_MAX_BODY: Final[int] = 3900
-
-# Plain-text replies (e.g. /chat) don't get wrapped in <pre>, so we can use a
-# slightly larger budget. Still leaves headroom below the 4096 hard limit.
 _TELEGRAM_PLAIN_MAX: Final[int] = 4000
 
 
@@ -77,16 +55,8 @@ _TELEGRAM_PLAIN_MAX: Final[int] = 4000
 # Gatekeeper
 # ---------------------------------------------------------------------------
 
-
 async def _gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop every update from a non-authorized Telegram user.
-
-    Registered as a :class:`TypeHandler` at group ``-1`` so it runs before any
-    command handler. When the sender's ID does not match
-    :pyattr:`Settings.authorized_user_id`, we raise
-    :class:`ApplicationHandlerStop`, which makes ``python-telegram-bot`` skip
-    the rest of the handler chain for this update entirely.
-    """
+    """Drop every update from a non-authorized Telegram user."""
     user = update.effective_user
     if user is None or user.id != settings.authorized_user_id:
         sender_id = user.id if user else "anonymous"
@@ -98,48 +68,64 @@ async def _gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Helpers
 # ---------------------------------------------------------------------------
 
-
-def _extract_address(args: list[str]) -> str | None:
-    """Return the address argument if present and well-formed, else ``None``."""
-    if not args:
-        return None
-    candidate = args[0].strip()
-    return candidate if _ADDRESS_RE.match(candidate) else None
-
+def _extract_address_from_text(text: str) -> str | None:
+    """Scan the entire text for an EVM address and return it if found."""
+    match = _ADDRESS_RE.search(text)
+    return match.group(0) if match else None
 
 def _format_report(payload: str) -> str:
-    """Return an HTML-safe ``<pre>`` block containing the audit report.
-
-    If ``payload`` parses as JSON we pretty-print it (2-space indent); otherwise
-    we send it verbatim. Either way the content is HTML-escaped and clamped to
-    Telegram's per-message limit.
-    """
+    """Format audit report dari JSON mentah menjadi tampilan Telegram yang estetik."""
     text = payload.strip()
     try:
         parsed = json.loads(text)
+        
+        # Ekstrak data menyesuaikan struktur JSON asli dari CrewAI lu
+        if isinstance(parsed, dict) and ("risk_score" in parsed or "risk_label" in parsed):
+            score = parsed.get("risk_score", "N/A")
+            # Ambil "risk_label", kalau kaga ada baru cari "status", kalau kaga ada juga baru "UNKNOWN"
+            status = str(parsed.get("risk_label", parsed.get("status", "UNKNOWN"))).upper()
+            findings = parsed.get("detailed_findings", parsed.get("findings", []))
+            recommendation = parsed.get("recommendation", "")
+            
+            # Tentukan emoji
+            icon = "🟢" if status == "SAFE" or (isinstance(score, int) and score < 50) else "🔴"
+            
+            msg = f"{icon} <b>WEB3 CREW AUDIT REPORT</b>\n"
+            msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"<b>Status:</b> <code>{html.escape(status)}</code>\n"
+            msg += f"<b>Risk Score:</b> <code>{html.escape(str(score))}</code>\n\n"
+            
+            if findings:
+                msg += "<b>🚨 Findings:</b>\n"
+                if isinstance(findings, list):
+                    for finding in findings:
+                        msg += f"• <i>{html.escape(str(finding))}</i>\n"
+                else:
+                    msg += f"• <i>{html.escape(str(findings))}</i>\n"
+            
+            if recommendation:
+                msg += f"\n<b>💡 Rekomendasi:</b>\n<i>{html.escape(str(recommendation))}</i>\n"
+            
+            return msg
+            
+        # Fallback kalau format JSON-nya aneh
         text = json.dumps(parsed, indent=2, ensure_ascii=False)
     except (ValueError, TypeError):
-        pass  # Send as raw text — formatting it was best-effort.
+        pass  # Kalau bukan JSON, biarin jadi raw text
 
+    # Clamp limit Telegram
     if len(text) > _TELEGRAM_MAX_BODY:
         text = text[:_TELEGRAM_MAX_BODY] + "\n…(truncated)"
 
     return f"<pre>{html.escape(text)}</pre>"
 
+def _format_chat_reply(payload: str) -> str:
+    text = (payload or "").strip()
+    if len(text) > _TELEGRAM_PLAIN_MAX:
+        text = text[:_TELEGRAM_PLAIN_MAX] + "\n…(truncated)"
+    return html.escape(text)
 
-async def _run_with_heartbeat(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    crew,
-) -> str:
-    """Run any CrewAI crew in a worker thread while keeping the chat alive.
-
-    CrewAI's ``kickoff()`` is synchronous and can take 30-120 seconds. We run
-    it on a thread (``asyncio.to_thread``) so the bot's event loop stays free,
-    and we fire a recurring ``ChatAction.TYPING`` so Telegram shows the
-    'typing…' indicator and doesn't time the conversation out.
-    """
+async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE, *, crew) -> str:
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
 
     async def _heartbeat() -> None:
@@ -155,7 +141,6 @@ async def _run_with_heartbeat(
         result = await asyncio.to_thread(crew.kickoff)
     finally:
         heartbeat.cancel()
-        # Suppress the cancellation so it doesn't leak into the caller.
         try:
             await heartbeat
         except (asyncio.CancelledError, Exception):
@@ -165,9 +150,8 @@ async def _run_with_heartbeat(
 
 
 # ---------------------------------------------------------------------------
-# Command handlers
+# Command & Message Handlers
 # ---------------------------------------------------------------------------
-
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Greet the authorized user and report bot status."""
@@ -178,180 +162,101 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>Status</b>\n"
         f"• LLM: <code>{html.escape(settings.llm_model)}</code>\n"
         f"• Chain ID: <code>{settings.chain_id}</code>\n"
-        f"• Max risk score: <code>{settings.max_risk_score}</code>\n"
-        f"• Authorized user: <code>{settings.authorized_user_id}</code>\n\n"
-        "<b>Commands</b>\n"
-        "• <code>/check &lt;address&gt;</code> — audit only (no transaction)\n"
-        "• <code>/mint &lt;address&gt;</code> — audit + mint if safe\n"
-        "• <code>/chat &lt;text&gt;</code> — ask anything (SUPERAGENT mode)"
+        f"• Max risk: <code>{settings.max_risk_score}</code>\n\n"
+        "<b>Cara Pakai</b>\n"
+        "Tinggal ngobrol biasa aja. Contoh:\n"
+        "• <i>'Tolong cek ini 0x...'</i> (Otomatis Audit)\n"
+        "• <i>'Hajar mint contract ini 0x...'</i> (Otomatis Mint)\n"
+        "• <i>'Coy, jelasin cara bypass gas war'</i> (Otomatis Chat)"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
 
-async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run the audit-only pipeline and return the JSON risk report."""
-    address = _extract_address(context.args or [])
-    if address is None:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Usage: <code>/check 0x...</code> (40 hex chars after 0x)",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    await update.message.reply_text(  # type: ignore[union-attr]
-        f"Auditing <code>{html.escape(address)}</code>… this can take 30-90s.",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        crew = build_crew(token_address=address, audit_only=True)
-        result = await _run_with_heartbeat(update, context, crew=crew)
-    except Exception:
-        logger.exception("Audit pipeline failed for %s", address)
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Audit pipeline failed. Check the bot logs for details.",
-        )
-        return
-
-    await update.message.reply_text(  # type: ignore[union-attr]
-        _format_report(result), parse_mode=ParseMode.HTML
-    )
-
-
-async def mint_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run the full pipeline and (if audit passes) execute a mint."""
-    address = _extract_address(context.args or [])
-    if address is None:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Usage: <code>/mint 0x...</code> (40 hex chars after 0x)",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    await update.message.reply_text(  # type: ignore[union-attr]
-        f"Running full pipeline on <code>{html.escape(address)}</code>… "
-        "the executor will refuse if the audit fails.",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        crew = build_crew(token_address=address, action="mint", audit_only=False)
-        result = await _run_with_heartbeat(update, context, crew=crew)
-    except Exception:
-        logger.exception("Mint pipeline failed for %s", address)
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Mint pipeline failed. Check the bot logs for details.",
-        )
-        return
-
-    tx_hash_match = _TX_HASH_RE.search(result)
-    if tx_hash_match:
-        tx_hash = tx_hash_match.group(0)
-        await update.message.reply_text(  # type: ignore[union-attr]
-            f"<b>TxHash</b>: <code>{tx_hash}</code>\n\n{_format_report(result)}",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            _format_report(result), parse_mode=ParseMode.HTML
-        )
-
-
-def _format_chat_reply(payload: str) -> str:
-    """Return a plain-text Telegram body for a SUPERAGENT chat reply.
-
-    Unlike ``_format_report``, we do NOT wrap the content in ``<pre>``: the
-    chat reply is conversational, may contain its own light markdown, and the
-    user expects it to read like a human message. We still HTML-escape so the
-    Telegram parser cannot be tricked by stray ``<`` characters, and we clamp
-    to the per-message limit.
+async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    text = (payload or "").strip()
-    if len(text) > _TELEGRAM_PLAIN_MAX:
-        text = text[:_TELEGRAM_PLAIN_MAX] + "\n…(truncated)"
-    return html.escape(text)
-
-
-async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run the SUPERAGENT-persona ChatAgent on a free-form ``/chat`` request.
-
-    Unlike ``/check`` and ``/mint``, this command:
-
-    * Accepts any non-empty free-form text (no address validation).
-    * Builds a single-agent chat crew (separate from the audit/mint pipeline).
-    * Replies in plain HTML-escaped text rather than a JSON ``<pre>`` block.
+    Intelligent router yang menggantikan slash commands.
+    Membaca input natural dari user dan memicu pipeline yang tepat.
     """
-    args = context.args or []
-    user_input = " ".join(args).strip() if args else ""
-    if not user_input:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Usage: <code>/chat &lt;free-form question&gt;</code>\n\n"
-            "Examples:\n"
-            "• <code>/chat cara setup VPS Ubuntu untuk Node.js</code>\n"
-            "• <code>/chat kenapa /mint tadi bilang reverted?</code>\n"
-            "• <code>/chat 3 cara monetize bot Telegram</code>",
+    user_input = update.message.text.strip()  # type: ignore[union-attr]
+    user_input_lower = user_input.lower()
+    
+    # Deteksi address di dalam pesan
+    address = _extract_address_from_text(user_input)
+
+    # 1. ROUTING: MINT PIPELINE
+    if address and any(keyword in user_input_lower for keyword in ["mint", "hajar", "gas", "buy"]):
+        await update.message.reply_text(
+            f"Eksekusi MINT pipeline untuk <code>{html.escape(address)}</code>…\nExecutor standby menunggu hasil audit.",
             parse_mode=ParseMode.HTML,
         )
+        try:
+            crew = build_crew(token_address=address, action="mint", audit_only=False)
+            result = await _run_with_heartbeat(update, context, crew=crew)
+            tx_hash_match = _TX_HASH_RE.search(result)
+            if tx_hash_match:
+                tx_hash = tx_hash_match.group(0)
+                await update.message.reply_text(
+                    f"<b>TxHash</b>: <code>{tx_hash}</code>\n\n{_format_report(result)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.message.reply_text(_format_report(result), parse_mode=ParseMode.HTML)
+        except Exception:
+            logger.exception("Mint pipeline failed for %s", address)
+            await update.message.reply_text("Mint pipeline gagal. Cek log server.")
         return
 
-    await update.message.reply_text(  # type: ignore[union-attr]
-        "SUPERAGENT processing… (10-30s)",
-    )
+    # 2. ROUTING: AUDIT PIPELINE
+    if address and any(keyword in user_input_lower for keyword in ["cek", "check", "audit", "liat", "aman"]):
+        await update.message.reply_text(
+            f"Scanning audit untuk <code>{html.escape(address)}</code>… (30-90s).",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            crew = build_crew(token_address=address, audit_only=True)
+            result = await _run_with_heartbeat(update, context, crew=crew)
+            await update.message.reply_text(_format_report(result), parse_mode=ParseMode.HTML)
+        except Exception:
+            logger.exception("Audit pipeline failed for %s", address)
+            await update.message.reply_text("Audit pipeline gagal. Cek log server.")
+        return
 
+    # 3. ROUTING: SUPERAGENT CHAT (Fallback jika tidak ada instruksi teknis di atas)
+    await update.message.reply_text("SUPERAGENT processing… (10-30s)")
     try:
         crew = build_chat_crew(user_input)
         result = await _run_with_heartbeat(update, context, crew=crew)
+        await update.message.reply_text(_format_chat_reply(result), parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Chat pipeline failed")
-        await update.message.reply_text(  # type: ignore[union-attr]
-            "Chat pipeline failed. Check the bot logs for details.",
-        )
-        return
-
-    await update.message.reply_text(  # type: ignore[union-attr]
-        _format_chat_reply(result),
-        parse_mode=ParseMode.HTML,
-    )
+        await update.message.reply_text("Chat pipeline gagal. Cek log server.")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-
 def build_application() -> Application:
-    """Construct the configured :class:`telegram.ext.Application`.
-
-    Refuses to build the application when either ``TELEGRAM_BOT_TOKEN`` or
-    ``AUTHORIZED_USER_ID`` is missing — better to fail loudly at startup than
-    boot a bot with no auth wall.
-    """
     if not settings.telegram_bot_token:
-        raise SystemExit(
-            "TELEGRAM_BOT_TOKEN is not set. Get one from @BotFather and add it to .env."
-        )
+        raise SystemExit("TELEGRAM_BOT_TOKEN is not set.")
     if settings.authorized_user_id == 0:
-        raise SystemExit(
-            "AUTHORIZED_USER_ID is not set (or is 0). Message @userinfobot on "
-            "Telegram to find yours and add it to .env. Refusing to start an "
-            "unauthenticated bot."
-        )
+        raise SystemExit("AUTHORIZED_USER_ID is not set.")
 
     app = Application.builder().token(settings.telegram_bot_token).build()
 
-    # Gatekeeper runs FIRST. ApplicationHandlerStop from group -1 short-circuits
-    # the entire handler chain, so unauthorized updates never reach group 0.
+    # OPSEC Gatekeeper
     app.add_handler(TypeHandler(Update, _gatekeeper), group=-1)
 
+    # Command Handler murni cuma buat /start
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("check", check_command))
-    app.add_handler(CommandHandler("mint", mint_command))
-    app.add_handler(CommandHandler("chat", chat_command))
+    
+    # Message Handler menangkap semua teks biasa dan memasukkannya ke router kepintaran buatan lu
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_router))
 
     return app
 
 
-def main() -> None:  # pragma: no cover — exercised only by the actual bot run.
+def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
