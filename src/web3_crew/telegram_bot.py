@@ -120,10 +120,28 @@ def _format_report(payload: str) -> str:
     return f"<pre>{html.escape(text)}</pre>"
 
 def _format_chat_reply(payload: str) -> str:
+    """Format plain text balasan chat dengan menerjemahkan Markdown ke HTML Telegram."""
     text = (payload or "").strip()
-    if len(text) > _TELEGRAM_PLAIN_MAX:
-        text = text[:_TELEGRAM_PLAIN_MAX] + "\n…(truncated)"
-    return html.escape(text)
+    
+    # 1. POTONG DULUAN di awal (sebelum ada tag HTML yang terbentuk)
+    # Dikurangi 20 karakter buat ngasih ruang buat tulisan "\n…(truncated)"
+    limit = _TELEGRAM_PLAIN_MAX - 20
+    if len(text) > limit:
+        text = text[:limit] + "\n…(truncated)"
+        
+    # 2. Pre-processing: Ubah <br> jadi Enter betulan
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'^\|?[\s\-:]+\|[\s\-:\|]+\|?$', '', text, flags=re.MULTILINE)
+    
+    # 3. Escape karakter berbahaya (<, >)
+    text = html.escape(text)
+    
+    # 4. Terjemahkan sintaks Markdown ke tag HTML Telegram
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
+    text = re.sub(r'(?<!\*)\*([^\*]+)\*(?!\*)', r'<i>\1</i>', text)
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+        
+    return text
 
 async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE, *, crew) -> str:
     chat_id = update.effective_chat.id  # type: ignore[union-attr]

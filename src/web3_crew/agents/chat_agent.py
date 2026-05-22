@@ -8,6 +8,7 @@ This agent is the entry point for ``/chat <text>`` Telegram commands. It:
 2. Uses :class:`web3_crew.tools.skill_router.SkillRouterTool` to dynamically
    pull the relevant ``SKILL.md`` body for the user's request, then synthesizes
    an answer in SUPERAGENT style.
+3. Uses ScrapeWebsiteTool to extract content from URLs provided by users.
 
 The persona is loaded from ``.agents/persona/*.md`` at agent-creation time.
 Failure to find a persona file is non-fatal — we fall back to a minimal
@@ -20,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from crewai import Agent
+from crewai_tools import ScrapeWebsiteTool
 
 from web3_crew.llm import create_llm
 from web3_crew.tools.skill_router import SkillRouterTool
@@ -66,9 +68,9 @@ def load_persona(persona_dir: Path | None = None) -> str:
 def create_chat_agent(persona_dir: Path | None = None) -> Agent:
     """Build the SUPERAGENT-persona ChatAgent.
 
-    The agent has a single tool (``skill_router``) which it must call once per
-    user turn before composing its answer. The persona is injected into
-    ``backstory`` so it is honored across every interaction without any
+    The agent has two tools: skill_router for domain-specific knowledge and
+    scrape_website for extracting content from URLs. The persona is injected
+    into ``backstory`` so it is honored across every interaction without any
     per-call prompt engineering.
     """
     persona = load_persona(persona_dir)
@@ -79,12 +81,14 @@ def create_chat_agent(persona_dir: Path | None = None) -> Agent:
             "language, with concrete executable steps. Use the skill_router "
             "tool to pull domain-specific knowledge when the request touches a "
             "specialized area (server, monetize, content, automation, data, "
-            "API, AI, files, frontend, audit, strategy, debug). For Web3 "
-            "questions about THIS bot itself, the skill_router will surface "
-            "the matching repo skill — synthesize from it, do not paste it raw."
+            "API, AI, files, frontend, audit, strategy, debug). Use the "
+            "scrape_website tool to extract content from any URLs provided by "
+            "the user. For Web3 questions about THIS bot itself, the "
+            "skill_router will surface the matching repo skill — synthesize "
+            "from it, do not paste it raw."
         ),
         backstory=persona,
-        tools=[SkillRouterTool()],
+        tools=[SkillRouterTool(), ScrapeWebsiteTool()],
         llm=create_llm(),
         verbose=True,
         allow_delegation=False,
