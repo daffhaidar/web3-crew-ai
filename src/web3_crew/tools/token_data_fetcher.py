@@ -19,7 +19,7 @@ class TokenDataFetcherTool(BaseTool):
     api_key: str = Field(default_factory=lambda: settings.etherscan_api_key)
 
     def _run(self, token_address: str) -> str:
-        base_url = "https://api.etherscan.io/api"
+        base_url = "https://api.etherscan.io/v2/api"
         results: dict[str, Any] = {"token_address": token_address}
 
         with httpx.Client(timeout=30) as client:
@@ -27,6 +27,7 @@ class TokenDataFetcherTool(BaseTool):
             source_resp = client.get(
                 base_url,
                 params={
+                    "chainid": settings.chain_id,
                     "module": "contract",
                     "action": "getsourcecode",
                     "address": token_address,
@@ -51,6 +52,7 @@ class TokenDataFetcherTool(BaseTool):
             creation_resp = client.get(
                 base_url,
                 params={
+                    "chainid": settings.chain_id,
                     "module": "contract",
                     "action": "getcontractcreation",
                     "contractaddresses": token_address,
@@ -69,6 +71,7 @@ class TokenDataFetcherTool(BaseTool):
             supply_resp = client.get(
                 base_url,
                 params={
+                    "chainid": settings.chain_id,
                     "module": "stats",
                     "action": "tokensupply",
                     "contractaddress": token_address,
