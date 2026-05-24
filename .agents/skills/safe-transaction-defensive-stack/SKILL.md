@@ -1,13 +1,33 @@
 ---
 name: safe-transaction-defensive-stack
-description: Reference for the SafeTransactionTool defensive execution stack — the 4 honest status codes (success/reverted/pending/rejected), ETH budget cap, opt-in RBF, and RPC-error-during-receipt-poll handling. Use this when debugging a /mint result, when the user asks "why did the bot say X", or when extending the tool with a new on-chain action.
+description: Reference for the SafeTransactionTool defensive execution stack — the Blind Execution / Generic ABI fallback, the 4 honest status codes (success/reverted/pending/rejected), ETH budget cap, opt-in RBF, and RPC-error-during-receipt-poll handling. Use this when debugging a /mint result, when the user asks "why did the bot say X", or when extending the tool with a new on-chain action.
 ---
 
 # SafeTransactionTool — Defensive Execution Stack
 
-Single source of truth: `src/web3_crew/tools/safe_transaction.py`. Tests at
-`tests/test_tools.py` (search for `test_status_*`, `test_rbf_*`, `test_budget_*`,
-`test_receipt_*`).
+Single source of truth: `src/web3_crew/tools/safe_transaction.py` plus the
+hardcoded fallbacks in `src/web3_crew/tools/abi_constants.py`. Tests live
+at `tests/test_abi_constants.py` and `tests/test_safe_transaction_blind_exec.py`.
+
+## ABI handling — Blind Execution (the LLM never sees raw ABI)
+
+The tool **does not accept an `abi` field in its input**. Passing one is
+silently dropped with a warning log. ABI resolution stays inside Python
+and picks one of three modes:
+
+| Mode | Trigger | Source | Returned `abi_source` |
+|---|---|---|---|
+| Etherscan smart parse | `function_name` set + contract verified + function on-chain | Etherscan V2 `getabi`, then `find_function_entry` keeps only the one entry needed | `etherscan_parsed` |
+| Generic ERC-721/ERC-20 | Unverified contract OR Etherscan miss, BUT `function_name` matches a hardcoded fallback (`mint`/`publicMint`/`safeMint` or `transfer`/`approve`/`transferFrom`) | `GENERIC_ERC721_ABI` / `GENERIC_ERC20_ABI` in `abi_constants.py` | `generic_erc721` / `generic_erc20` |
+| Blind calldata | Caller sets `action='raw'` AND supplies `raw_calldata` (0x-prefixed hex with ≥ 4 byte selector) | No ABI lookup at all — bytes go on the wire as-is | `raw_calldata` |
+
+If none of the three apply (unknown function, no `raw_calldata`), the
+response is `{"status": "rejected", "reason": "...", "abi_source": "no_match"}`.
+
+The tool's response **always** carries `abi_source` and `function_signature`
+(a one-line Solidity-style string) so the agent can verify what actually
+ran, but **never** the raw ABI JSON. This is the bug-fix that closes the
+8 K context OOM on `cerebras/gpt-oss-120b`.
 
 ## The four honest status codes
 
@@ -104,6 +124,26 @@ the `explorer_url` field.
 2. On failure, `return {"status": "rejected", "reason": "..."}` (don't raise).
 3. Add a unit test asserting both the status string AND the absence of a
    `tx_hash` field in the response.
+
+## Adding a new generic ABI fallback (recipe)
+
+Do this when a new EVM standard (e.g. ERC-1155 batchMint) becomes common
+enough that we want bullet-proof blind execution for it.
+
+1. Append the minimal entry — name, inputs, outputs, stateMutability — to
+   `GENERIC_ERC1155_ABI` (or whichever constant) in
+   `src/web3_crew/tools/abi_constants.py`. Keep entries **small**: only
+   the functions the executor will actually call.
+2. Add the names to a new frozenset (`ERC1155_MINT_FUNCTIONS`) and update
+   `_pick_generic_abi_for` in `safe_transaction.py` to route the new
+   function names to it.
+3. Add a test in `tests/test_abi_constants.py` asserting the new entry
+   exists and the frozenset matches the ABI surface.
+4. Add a test in `tests/test_safe_transaction_blind_exec.py::TestPickGenericAbi`
+   covering the new routing.
+5. **Never** put rug-pull-shaped functions in a generic ABI (e.g. mint on
+   ERC-20, `setFee`, `blacklist`, unlimited approve). Those entries
+   would short-circuit the auditor's static analysis.
 4. Update `.env.example` and `Settings` if a new tunable is introduced.
 
 ## What this skill is NOT
