@@ -68,6 +68,15 @@ class Settings(BaseSettings):
 
     # Optional
     dexscreener_api_key: str = Field(default="", description="DexScreener API key (optional)")
+    alchemy_api_key: str = Field(
+        default="",
+        description=(
+            "Optional Alchemy API key for the post-mint metadata fetcher "
+            "(NFT name, image, traits). When empty, the fetcher gracefully "
+            "degrades to a static Etherscan + OpenSea link in the Telegram "
+            "response. Get a free key at https://dashboard.alchemy.com/."
+        ),
+    )
 
     # Safety thresholds
     max_risk_score: int = Field(

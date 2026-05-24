@@ -32,10 +32,10 @@ from telegram.ext import (
     Application,
     ApplicationHandlerStop,
     CommandHandler,
-    MessageHandler,
-    filters,
     ContextTypes,
+    MessageHandler,
     TypeHandler,
+    filters,
 )
 
 from web3_crew.config import settings
@@ -79,7 +79,33 @@ def _format_report(payload: str) -> str:
     text = payload.strip()
     try:
         parsed = json.loads(text)
-        
+
+        # Mint success path: surface the post-tx metadata block.
+        # metadata_summary is already Telegram-safe HTML produced by
+        # post_tx_metadata.fetch_post_tx_metadata; we just stitch it
+        # on top of the standard tx-status header.
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("status") == "success"
+            and parsed.get("tx_hash")
+        ):
+            tx_hash = str(parsed.get("tx_hash"))
+            explorer = parsed.get("explorer_url") or ""
+            action = str(parsed.get("action") or "tx")
+            meta = parsed.get("metadata_summary") or ""
+            msg = "\U0001f7e2 <b>TX SUCCESS</b>\n"
+            msg += "\u2501" * 20 + "\n"
+            msg += f"<b>Action:</b> <code>{html.escape(action)}</code>\n"
+            msg += f"<b>TxHash:</b> <code>{html.escape(tx_hash)}</code>\n"
+            if explorer:
+                msg += f'<a href="{html.escape(explorer)}">View on explorer</a>\n'
+            if meta:
+                # ``metadata_summary`` is intentionally pre-formatted HTML
+                # (links + bold + code) from post_tx_metadata. Inserting
+                # raw would defeat the purpose of building it there.
+                msg += "\n" + meta + "\n"
+            return msg
+
         # Ekstrak data menyesuaikan struktur JSON asli dari CrewAI lu
         if isinstance(parsed, dict) and ("risk_score" in parsed or "risk_label" in parsed):
             score = parsed.get("risk_score", "N/A")
@@ -87,15 +113,15 @@ def _format_report(payload: str) -> str:
             status = str(parsed.get("risk_label", parsed.get("status", "UNKNOWN"))).upper()
             findings = parsed.get("detailed_findings", parsed.get("findings", []))
             recommendation = parsed.get("recommendation", "")
-            
+
             # Tentukan emoji
             icon = "🟢" if status == "SAFE" or (isinstance(score, int) and score < 50) else "🔴"
-            
+
             msg = f"{icon} <b>WEB3 CREW AUDIT REPORT</b>\n"
-            msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━\n"
             msg += f"<b>Status:</b> <code>{html.escape(status)}</code>\n"
             msg += f"<b>Risk Score:</b> <code>{html.escape(str(score))}</code>\n\n"
-            
+
             if findings:
                 msg += "<b>🚨 Findings:</b>\n"
                 if isinstance(findings, list):
@@ -103,12 +129,12 @@ def _format_report(payload: str) -> str:
                         msg += f"• <i>{html.escape(str(finding))}</i>\n"
                 else:
                     msg += f"• <i>{html.escape(str(findings))}</i>\n"
-            
+
             if recommendation:
                 msg += f"\n<b>💡 Rekomendasi:</b>\n<i>{html.escape(str(recommendation))}</i>\n"
-            
+
             return msg
-            
+
         # Fallback kalau format JSON-nya aneh
         text = json.dumps(parsed, indent=2, ensure_ascii=False)
     except (ValueError, TypeError):
@@ -123,25 +149,25 @@ def _format_report(payload: str) -> str:
 def _format_chat_reply(payload: str) -> str:
     """Format plain text balasan chat dengan menerjemahkan Markdown ke HTML Telegram."""
     text = (payload or "").strip()
-    
+
     # 1. POTONG DULUAN di awal (sebelum ada tag HTML yang terbentuk)
     # Dikurangi 20 karakter buat ngasih ruang buat tulisan "\n…(truncated)"
     limit = _TELEGRAM_PLAIN_MAX - 20
     if len(text) > limit:
         text = text[:limit] + "\n…(truncated)"
-        
+
     # 2. Pre-processing: Ubah <br> jadi Enter betulan
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'^\|?[\s\-:]+\|[\s\-:\|]+\|?$', '', text, flags=re.MULTILINE)
-    
+
     # 3. Escape karakter berbahaya (<, >)
     text = html.escape(text)
-    
+
     # 4. Terjemahkan sintaks Markdown ke tag HTML Telegram
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
     text = re.sub(r'(?<!\*)\*([^\*]+)\*(?!\*)', r'<i>\1</i>', text)
     text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-        
+
     return text
 
 async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE, *, crew) -> str:
@@ -198,16 +224,16 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
     """
     user_input = update.message.text.strip()  # type: ignore[union-attr]
     user_id = update.effective_user.id  # type: ignore[union-attr]
-    
+
     # Get augmented input with conversational history
     augmented_input = ContextManager.get_augmented_input(
         context.user_data,
         user_input,
         user_id
     )
-    
+
     augmented_input_lower = augmented_input.lower()
-    
+
     # Deteksi address di dalam pesan (using augmented input)
     address = _extract_address_from_text(augmented_input)
 
@@ -228,7 +254,7 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
             else:
                 bot_reply = _format_report(result)
                 await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
-            
+
             # Store exchange with original user_input (not augmented)
             ContextManager.store_exchange(
                 context.user_data,
@@ -252,7 +278,7 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
             result = await _run_with_heartbeat(update, context, crew=crew)
             bot_reply = _format_report(result)
             await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
-            
+
             # Store exchange with original user_input (not augmented)
             ContextManager.store_exchange(
                 context.user_data,
@@ -272,7 +298,7 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
         result = await _run_with_heartbeat(update, context, crew=crew)
         bot_reply = _format_chat_reply(result)
         await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
-        
+
         # Store exchange with original user_input (not augmented)
         ContextManager.store_exchange(
             context.user_data,
@@ -302,7 +328,7 @@ def build_application() -> Application:
 
     # Command Handler murni cuma buat /start
     app.add_handler(CommandHandler("start", start_command))
-    
+
     # Message Handler menangkap semua teks biasa dan memasukkannya ke router kepintaran buatan lu
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_router))
 
