@@ -29,16 +29,25 @@ Two independent pipelines share one LLM factory but have no other coupling:
 
 1. **Data Gatherer** (`src/web3_crew/agents/data_gatherer.py`)
    - Tools: `TokenDataFetcherTool`, `DexScreenerTool`
-   - Output: token metadata (name, symbol, decimals, total supply, source
-     code from Etherscan), DEX liquidity snapshot (pairs, USD liquidity, 24h
-     volume).
+   - Output: token metadata (name, deployer, total supply), `abi_summary`
+     (short string — NOT the raw ABI), `source_findings` (pre-computed
+     static-analysis hits, NOT the raw Solidity source), DEX liquidity
+     snapshot.
+   - **LLM-context discipline**: raw ABI and raw source code are
+     parsed/scanned inside `TokenDataFetcherTool` and discarded before
+     the response is built. Neither field ever enters the agent context.
+     See `src/web3_crew/tools/source_analyzer.py` for the regex registry.
 
 2. **Smart Contract Auditor** (`src/web3_crew/agents/contract_auditor.py`)
-   - Tools: `ContractAnalyzerTool`, `RugPullDetectorTool`
-   - Output: JSON `{risk_score: int (0-100), flags: [str], summary: str}`.
-     Patterns checked include hidden mint, blacklist, owner-only fee setters,
-     pausable transfers, fee-on-transfer, mintable supply, ownership
-     concentration, proxy backdoor.
+   - Tools: `RugPullDetectorTool` only. `ContractAnalyzerTool` was
+     removed from the agent's tool list because invoking it forced the
+     raw source to round-trip through the LLM context. The analyzer's
+     logic now lives in `source_analyzer.analyze_source_code` and is
+     called inline by the gatherer.
+   - Output: JSON `{risk_score: int (0-100), risk_label: str, findings,
+     recommendation: str}`. Patterns checked include hidden mint,
+     blacklist, owner-only fee setters, pausable transfers, proxy
+     backdoor, selfdestruct, unlimited approve.
 
 3. **Transaction Executor** (`src/web3_crew/agents/tx_executor.py`)
    - Tools: `SafeTransactionTool` (the only tool that touches a wallet)

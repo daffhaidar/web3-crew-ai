@@ -2,22 +2,26 @@
 
 LLM-context discipline
 ----------------------
-This tool used to return the **full** Etherscan ABI (a 10–50 KB JSON
-string) inside its output. The auditor and executor agents then carried
-that ABI in their LLM context all the way through the pipeline, which
-on small-context models (e.g. ``cerebras/gpt-oss-120b`` at 8K tokens)
-overflowed and silently truncated mid-mint.
+This tool used to return two LLM-hostile fields:
 
-The tool now returns an :data:`abi_summary` string instead — a short,
-human-readable list of mint-shaped function signatures parsed from the
-ABI **inside Python**. The full ABI JSON never leaves this module.
-Downstream agents that actually need to call a function go through
-:class:`web3_crew.tools.safe_transaction.SafeTransactionTool`, which
-re-fetches the ABI from Etherscan and parses it server-side.
+1. The **full** Etherscan ABI (10–50 KB JSON string) — fixed in the
+   Blind Execution PR; replaced with :data:`abi_summary` plus
+   server-side resolution inside
+   :class:`web3_crew.tools.safe_transaction.SafeTransactionTool`.
+2. The **flattened Solidity source code** (often 5–80 KB of text) —
+   fixed in this module. The static analyzer
+   :func:`web3_crew.tools.source_analyzer.analyze_source_code` runs
+   *inline* here, and the result is condensed into:
 
-The ``source_code`` field is preserved because the contract auditor's
-static analyzer is regex-based and runs against the raw Solidity text;
-trimming it would break the rug-pull detector.
+   * ``source_findings`` — short JSON list of regex-matched patterns
+     (each entry < 200 chars).
+   * ``source_summary`` — one-line digest the auditor LLM can read.
+
+The raw ``source_code`` field is no longer included in the response.
+On small-context models (``cerebras/gpt-oss-120b`` at 8K tokens, or
+locally-hosted Qwen2 at similar limits) the previous payload regularly
+overflowed mid-pipeline and crashed ``/mint``. This refactor keeps the
+full audit signal while shrinking the LLM payload by ~95 %.
 """
 
 import json
@@ -29,16 +33,22 @@ from pydantic import Field
 
 from web3_crew.config import settings
 from web3_crew.tools.abi_constants import summarize_mint_signatures
+from web3_crew.tools.source_analyzer import analyze_source_code
 
 
 class TokenDataFetcherTool(BaseTool):
     name: str = "token_data_fetcher"
     description: str = (
-        "Fetches on-chain token metadata from Etherscan: contract source code, "
-        "creator address, supply, and a SHORT summary of mint-shaped functions. "
-        "Does NOT return the raw contract ABI — only an `abi_summary` string. "
-        "Downstream tools fetch their own ABI internally when needed. "
-        "Input: a valid EVM token contract address."
+        "Fetches on-chain token metadata from Etherscan and runs static "
+        "analysis INTERNALLY on the contract source. Returns: contract "
+        "name, deployer address, total supply, an `abi_summary` string, "
+        "a `source_summary` headline, and a `source_findings` list of "
+        "pattern hits (each < 200 chars). Does NOT return the raw ABI "
+        "or the raw Solidity source code — both are processed inside "
+        "Python and discarded before the response is built. Downstream "
+        "tools (rug_pull_detector, safe_transaction) consume the "
+        "structured findings directly. Input: a valid EVM token "
+        "contract address."
     )
     api_key: str = Field(default_factory=lambda: settings.etherscan_api_key)
 
@@ -47,10 +57,8 @@ class TokenDataFetcherTool(BaseTool):
         results: dict[str, Any] = {"token_address": token_address}
 
         with httpx.Client(timeout=30) as client:
-            # 1. Get contract source code + ABI from getsourcecode.
-            #
-            # We pull the raw ABI from Etherscan, but immediately parse and
-            # discard it inside Python. The LLM only ever sees the summary.
+            # 1. Pull source code + ABI from getsourcecode. Both stay
+            # local to this function — only digests reach the response.
             source_resp = client.get(
                 base_url,
                 params={
@@ -66,21 +74,41 @@ class TokenDataFetcherTool(BaseTool):
                 contract_info = source_data["result"][0]
                 results["contract_name"] = contract_info.get("ContractName", "")
                 results["compiler_version"] = contract_info.get("CompilerVersion", "")
-                results["source_code"] = contract_info.get("SourceCode", "")
+
+                raw_source = contract_info.get("SourceCode", "")
                 abi_val = contract_info.get("ABI", "")
                 is_verified = bool(abi_val) and abi_val != "Contract source code not verified"
                 results["is_verified"] = is_verified
+
+                # Run regex static analysis inline. ``raw_source`` is
+                # consumed here and never echoed back into ``results``.
+                analysis = analyze_source_code(raw_source)
+                results["source_findings"] = analysis["findings"]
+                results["source_summary"] = analysis["summary"]
+                results["has_critical_finding"] = analysis["has_critical"]
+                results["has_high_finding"] = analysis["has_high"]
+
                 results["abi_summary"] = _summarize_abi(abi_val) if is_verified else (
                     "Contract unverified on Etherscan — ABI unavailable. "
                     "Executor will fall back to GENERIC_ERC721/ERC20 ABI or "
                     "blind calldata at mint time."
                 )
             else:
-                results["source_code"] = ""
+                results["contract_name"] = ""
+                results["compiler_version"] = ""
                 results["is_verified"] = False
+                # Run analyze on empty source so the response shape stays
+                # consistent across the verified / unverified / Etherscan-down
+                # branches. The function returns an explicit "no source"
+                # finding in that case.
+                analysis = analyze_source_code("")
+                results["source_findings"] = analysis["findings"]
+                results["source_summary"] = analysis["summary"]
+                results["has_critical_finding"] = analysis["has_critical"]
+                results["has_high_finding"] = analysis["has_high"]
                 results["abi_summary"] = "Etherscan returned no data for this address."
 
-            # 2. Get contract creator and creation tx
+            # 2. Contract creator + creation tx
             creation_resp = client.get(
                 base_url,
                 params={
@@ -99,7 +127,7 @@ class TokenDataFetcherTool(BaseTool):
                 results["deployer_address"] = ""
                 results["creation_tx"] = ""
 
-            # 3. Get token supply info
+            # 3. Token supply info
             supply_resp = client.get(
                 base_url,
                 params={
