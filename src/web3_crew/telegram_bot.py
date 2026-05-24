@@ -39,6 +39,7 @@ from telegram.ext import (
 )
 
 from web3_crew.config import settings
+from web3_crew.context_manager import ContextManager
 from web3_crew.crew import build_chat_crew, build_crew
 
 logger = logging.getLogger(__name__)
@@ -196,13 +197,22 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
     Membaca input natural dari user dan memicu pipeline yang tepat.
     """
     user_input = update.message.text.strip()  # type: ignore[union-attr]
-    user_input_lower = user_input.lower()
+    user_id = update.effective_user.id  # type: ignore[union-attr]
     
-    # Deteksi address di dalam pesan
-    address = _extract_address_from_text(user_input)
+    # Get augmented input with conversational history
+    augmented_input = ContextManager.get_augmented_input(
+        context.user_data,
+        user_input,
+        user_id
+    )
+    
+    augmented_input_lower = augmented_input.lower()
+    
+    # Deteksi address di dalam pesan (using augmented input)
+    address = _extract_address_from_text(augmented_input)
 
     # 1. ROUTING: MINT PIPELINE
-    if address and any(keyword in user_input_lower for keyword in ["mint", "hajar", "gas", "buy"]):
+    if address and any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "gas", "buy"]):
         await update.message.reply_text(
             f"Eksekusi MINT pipeline untuk <code>{html.escape(address)}</code>…\nExecutor standby menunggu hasil audit.",
             parse_mode=ParseMode.HTML,
@@ -213,19 +223,26 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
             tx_hash_match = _TX_HASH_RE.search(result)
             if tx_hash_match:
                 tx_hash = tx_hash_match.group(0)
-                await update.message.reply_text(
-                    f"<b>TxHash</b>: <code>{tx_hash}</code>\n\n{_format_report(result)}",
-                    parse_mode=ParseMode.HTML,
-                )
+                bot_reply = f"<b>TxHash</b>: <code>{tx_hash}</code>\n\n{_format_report(result)}"
+                await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
             else:
-                await update.message.reply_text(_format_report(result), parse_mode=ParseMode.HTML)
+                bot_reply = _format_report(result)
+                await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
+            
+            # Store exchange with original user_input (not augmented)
+            ContextManager.store_exchange(
+                context.user_data,
+                user_input,
+                bot_reply,
+                user_id
+            )
         except Exception:
             logger.exception("Mint pipeline failed for %s", address)
             await update.message.reply_text("Mint pipeline gagal. Cek log server.")
         return
 
     # 2. ROUTING: AUDIT PIPELINE
-    if address and any(keyword in user_input_lower for keyword in ["cek", "check", "audit", "liat", "aman"]):
+    if address and any(keyword in augmented_input_lower for keyword in ["cek", "check", "audit", "liat", "aman"]):
         await update.message.reply_text(
             f"Scanning audit untuk <code>{html.escape(address)}</code>… (30-90s).",
             parse_mode=ParseMode.HTML,
@@ -233,7 +250,16 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
         try:
             crew = build_crew(token_address=address, audit_only=True)
             result = await _run_with_heartbeat(update, context, crew=crew)
-            await update.message.reply_text(_format_report(result), parse_mode=ParseMode.HTML)
+            bot_reply = _format_report(result)
+            await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
+            
+            # Store exchange with original user_input (not augmented)
+            ContextManager.store_exchange(
+                context.user_data,
+                user_input,
+                bot_reply,
+                user_id
+            )
         except Exception:
             logger.exception("Audit pipeline failed for %s", address)
             await update.message.reply_text("Audit pipeline gagal. Cek log server.")
@@ -242,9 +268,18 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
     # 3. ROUTING: SUPERAGENT CHAT (Fallback jika tidak ada instruksi teknis di atas)
     await update.message.reply_text("SUPERAGENT processing… (10-30s)")
     try:
-        crew = build_chat_crew(user_input)
+        crew = build_chat_crew(augmented_input)
         result = await _run_with_heartbeat(update, context, crew=crew)
-        await update.message.reply_text(_format_chat_reply(result), parse_mode=ParseMode.HTML)
+        bot_reply = _format_chat_reply(result)
+        await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
+        
+        # Store exchange with original user_input (not augmented)
+        ContextManager.store_exchange(
+            context.user_data,
+            user_input,
+            bot_reply,
+            user_id
+        )
     except Exception:
         logger.exception("Chat pipeline failed")
         await update.message.reply_text("Chat pipeline gagal. Cek log server.")
