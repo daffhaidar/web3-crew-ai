@@ -87,6 +87,7 @@ from web3_crew.tools.abi_constants import (
     find_function_entry,
     function_signature,
 )
+from web3_crew.tools.post_tx_metadata import fetch_post_tx_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +479,7 @@ class SafeTransactionTool(BaseTool):
                     function_name=function_name or "raw",
                     abi_source=abi_source,
                     resolved_signature=resolved_signature,
+                    contract_address=contract_address,
                 )
 
             try:
@@ -528,6 +530,7 @@ class SafeTransactionTool(BaseTool):
                 budget_wei=budget_wei,
                 abi_source=abi_source,
                 resolved_signature=resolved_signature,
+                contract_address=contract_address,
             )
 
         except Exception as e:
@@ -628,6 +631,7 @@ def _submit_with_rbf(
     budget_wei: int,
     abi_source: str,
     resolved_signature: str,
+    contract_address: str = "",
 ) -> str:
     """Submit the EIP-1559 transaction; optionally retry under RBF.
 
@@ -756,6 +760,7 @@ def _submit_with_rbf(
             fee_mode="eip1559",
             abi_source=abi_source,
             resolved_signature=resolved_signature,
+            contract_address=contract_address,
         )
 
     # Unreachable: loop above always returns. Defensive fallback.
@@ -775,6 +780,7 @@ def _terminal_response(
     fee_mode: str,
     abi_source: str,
     resolved_signature: str,
+    contract_address: str = "",
 ) -> str:
     """Build the JSON response for a mined transaction.
 
@@ -812,10 +818,31 @@ def _terminal_response(
             **common,
         })
 
+    # Post-tx metadata enrichment. This block is intentionally
+    # additive: it runs only on the success path, is wrapped in a
+    # blanket try/except by fetch_post_tx_metadata itself, and on any
+    # failure returns a graceful fallback so the success response is
+    # never lost or corrupted. See post_tx_metadata.py for details.
+    try:
+        meta = fetch_post_tx_metadata(
+            receipt=receipt,
+            contract_address=contract_address,
+            chain_id=settings.chain_id,
+        )
+    except Exception:
+        # Belt-and-suspenders: fetch_post_tx_metadata is already
+        # non-raising, but if a future refactor breaks that contract
+        # we still must not lose the success result.
+        meta = {
+            "metadata_summary": "(Metadata fetch failed/pending)",
+            "metadata_status": "fallback",
+        }
+
     return json.dumps({
         "status": "success",
         "action": function_name,
         **common,
+        **meta,
     })
 
 
@@ -858,6 +885,7 @@ def _send_legacy(
     function_name: str,
     abi_source: str,
     resolved_signature: str,
+    contract_address: str = "",
 ) -> str:
     """Fallback for chains without EIP-1559 (pre-London forks, some L2s).
 
@@ -947,4 +975,5 @@ def _send_legacy(
         fee_mode="legacy",
         abi_source=abi_source,
         resolved_signature=resolved_signature,
+        contract_address=contract_address,
     )
