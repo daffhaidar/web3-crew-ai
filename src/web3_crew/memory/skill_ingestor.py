@@ -41,29 +41,34 @@ class SkillManager:
     FORBIDDEN_EXTENSIONS: Final[set[str]] = {".py", ".sh", ".exe", ".bat", ".bin"}
     # Hard cap on injected skill context. Cerebras gpt-oss-120b has an 8192
     # token (~32K char) total budget, of which roughly half must stay free for
-    # tool calls, agent reasoning, and user input. 12K characters ≈ 3K tokens
-    # of skill priming — enough to fit the 3 identity files + one m-skill, and
-    # still leave headroom. Per-command filtering (see ``get_skill_context``)
-    # is what keeps us inside this budget when many m-skills are installed.
-    MAX_CONTEXT_CHARS: Final[int] = 12000
+    # tool calls, agent reasoning, and user input. 16K characters ≈ 4K tokens
+    # of skill priming — enough to fit the 3 identity files (~6.4K) plus one
+    # full m-skill of ~6-10K and still leave Cerebras headroom. Files past the
+    # cap are *partially* loaded (the last one is truncated mid-content) so
+    # the skill router never silently drops everything when a single big file
+    # would otherwise blow the budget.
+    MAX_CONTEXT_CHARS: Final[int] = 16000
 
     # Always-on identity files. These short character / heartbeat documents
     # load on every invocation regardless of command — they are the bot's
-    # voice and survival instincts. Anything else (the ``m*_*.md`` skill
-    # modules) only loads when the ``command`` hint matches.
+    # voice, survival instincts, and crypto-operator code of conduct.
+    # Anything else (the topic-specific skill modules) only loads when the
+    # ``command`` hint matches.
     IDENTITY_FILE_PREFIXES: Final[tuple[str, ...]] = (
         "HEARTBEAT",
+        "HERMES",     # Crypto operator principles (user-funds-only, etc.)
         "IDENTITY",
         "SOUL",
     )
 
     # Mapping from command (``mint`` / ``check`` / ``chat`` / ...) to the
-    # ``m*`` skill prefixes that should be loaded on top of the identity
-    # files. This is the lightweight version of the AGENTS.md keyword router
-    # — deterministic per-command rather than per-token weighted.
+    # skill prefixes that should be loaded on top of the identity files.
+    # This is the lightweight version of the AGENTS.md keyword router --
+    # deterministic per-command rather than per-token weighted.
     #
-    # When extending: add new ``mXX_topic.md`` files to ``memory/skills/``,
-    # then add the prefix here under whichever command should pull it.
+    # When extending: add new ``<prefix>_topic.md`` files to
+    # ``memory/skills/`` then add the prefix here under whichever command
+    # should pull it.
     COMMAND_SKILL_MAP: Final[dict[str, tuple[str, ...]]] = {
         "mint": ("m10", "m13"),    # Web3 ops + universal NFT minter
         "check": ("m11",),         # Security / audit playbook
@@ -263,16 +268,39 @@ class SkillManager:
                     header = f"=== {skill_file.name} ==="
                     formatted = f"{header}\n{content}\n\n"
 
-                    # Check if adding this would exceed limit
-                    if total_chars + len(formatted) > self.MAX_CONTEXT_CHARS:
-                        # Add truncation notice
+                    # If the file fits in full, take it whole. Otherwise we
+                    # partially load it (header + as much body as fits) and
+                    # stop. Stopping entirely -- the old behavior -- silently
+                    # dropped the m-skills entirely whenever the next file
+                    # was bigger than the remaining budget, which made the
+                    # per-command router pointless in production.
+                    if total_chars + len(formatted) <= self.MAX_CONTEXT_CHARS:
+                        context_parts.append(formatted)
+                        total_chars += len(formatted)
+                        continue
+
+                    remaining = self.MAX_CONTEXT_CHARS - total_chars
+                    # Always keep the header visible so the LLM knows which
+                    # file got cut. ``header_block`` is small (~30 chars), so
+                    # if even that does not fit we just stop -- anything else
+                    # would be misleading garbage with no provenance.
+                    header_block = f"{header}\n"
+                    if remaining <= len(header_block) + 32:
                         context_parts.append(
-                            f"\n[TRUNCATED: Context exceeded {self.MAX_CONTEXT_CHARS} characters]"
+                            f"\n[TRUNCATED: Context exceeded "
+                            f"{self.MAX_CONTEXT_CHARS} characters]"
                         )
                         break
 
-                    context_parts.append(formatted)
-                    total_chars += len(formatted)
+                    body_budget = remaining - len(header_block) - 64  # leave room for notice
+                    partial_body = content[:body_budget].rstrip()
+                    context_parts.append(
+                        f"{header_block}{partial_body}\n"
+                        f"[TRUNCATED: file cut to fit "
+                        f"{self.MAX_CONTEXT_CHARS}-char budget]\n\n"
+                    )
+                    total_chars = self.MAX_CONTEXT_CHARS
+                    break
 
                 except Exception as e:
                     logger.error("Failed to read skill file %s: %s", skill_file.name, e)

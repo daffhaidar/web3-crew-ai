@@ -164,14 +164,111 @@ def test_empty_skills_dir_returns_empty_string(tmp_path: Path) -> None:
 def test_mint_context_fits_under_max_chars(populated_skills_dir: Path) -> None:
     """Make sure per-command filtering actually keeps us inside the budget.
 
-    With identity (~6 KB) + m10 + m13 (~24 KB) the unfiltered load blows
-    through the 12 KB cap. Per-command filter must still respect the cap,
-    so the result is truncated, not exploded.
+    With identity + m10 + m13 the unfiltered load blows through the cap.
+    Per-command filter must still respect ``MAX_CONTEXT_CHARS``, so the
+    result is truncated -- not exploded.
     """
     mgr = SkillManager(skills_dir=populated_skills_dir)
 
     ctx = mgr.get_skill_context(command="mint")
 
-    # 12 KB is the hard ceiling; allow tiny overhead for headers/truncation
-    # notice. Strict ``<= MAX_CONTEXT_CHARS + 200`` to flag drift.
+    # Hard ceiling; allow tiny overhead for headers / truncation notice.
     assert len(ctx) <= mgr.MAX_CONTEXT_CHARS + 200
+
+
+# --- partial-load behavior --------------------------------------------------
+# These guard the regression that motivated this PR: under the previous
+# "stop entirely if the next file does not fit" logic, a single big skill
+# file would silently drop ALL m-skills, making the per-command router
+# pointless in production.
+
+
+def test_oversized_skill_is_partially_loaded_not_dropped(tmp_path: Path) -> None:
+    """A file larger than the remaining budget must still load partially."""
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / "HEARTBEAT.md").write_text("HEARTBEAT-MARK\n", encoding="utf-8")
+    (skills / "m99_huge.md").write_text("HUGE-MARK\n" + ("x" * 50_000), encoding="utf-8")
+
+    mgr = SkillManager(skills_dir=skills)
+    mgr.COMMAND_SKILL_MAP = {"huge": ("m99",)}  # type: ignore[misc]
+
+    ctx = mgr.get_skill_context(command="huge")
+
+    # Header for the oversized file must be present (no silent drop).
+    assert "=== m99_huge.md ===" in ctx
+    # And the partial-truncation notice should fire.
+    assert "TRUNCATED" in ctx
+    # Final result respects the cap.
+    assert len(ctx) <= mgr.MAX_CONTEXT_CHARS + 200
+
+
+def test_partial_load_preserves_earlier_files_in_full(tmp_path: Path) -> None:
+    """When a later file is partial-cut, earlier files stay intact."""
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / "HEARTBEAT.md").write_text("HEARTBEAT-FULL-MARK\n", encoding="utf-8")
+    (skills / "IDENTITY.md").write_text("IDENTITY-FULL-MARK\n", encoding="utf-8")
+    (skills / "m77_big.md").write_text("BIG-START-MARK\n" + ("y" * 30_000), encoding="utf-8")
+
+    mgr = SkillManager(skills_dir=skills)
+    mgr.COMMAND_SKILL_MAP = {"big": ("m77",)}  # type: ignore[misc]
+
+    ctx = mgr.get_skill_context(command="big")
+
+    # Earlier (in-budget) files load fully.
+    assert "HEARTBEAT-FULL-MARK" in ctx
+    assert "IDENTITY-FULL-MARK" in ctx
+    # The big file gets its header and partial body.
+    assert "=== m77_big.md ===" in ctx
+    assert "BIG-START-MARK" in ctx
+    # But not the full body.
+    assert ctx.count("y") < 30_000
+
+
+# --- HERMES.md is always-on -------------------------------------------------
+
+
+def test_hermes_loads_as_identity_for_every_known_command(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / "HERMES.md").write_text("HERMES-MARK\n", encoding="utf-8")
+    (skills / "SOUL.md").write_text("SOUL-MARK\n", encoding="utf-8")
+    (skills / "m10_web3_ops.md").write_text("m10\n", encoding="utf-8")
+    (skills / "m11_security_audit.md").write_text("m11\n", encoding="utf-8")
+    (skills / "m4_telegram_bots.md").write_text("m4\n", encoding="utf-8")
+
+    mgr = SkillManager(skills_dir=skills)
+
+    for cmd in ("mint", "check", "chat"):
+        ctx = mgr.get_skill_context(command=cmd)
+        assert "HERMES-MARK" in ctx, f"HERMES.md missing for /{cmd}"
+        assert "SOUL-MARK" in ctx, f"SOUL.md missing for /{cmd}"
+
+
+def test_production_check_pipeline_loads_m11_fully(tmp_path: Path) -> None:
+    """Regression guard: /check must include the full audit playbook.
+
+    Pre-PR this test would have failed because the 12K cap caused m11 to be
+    silently dropped after identity loaded. Verifies the combination of
+    bigger cap + partial-load semantics actually delivers the m-skill body
+    to the LLM.
+    """
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    # Use realistic sizes from production.
+    (skills / "HEARTBEAT.md").write_text("h" * 1500, encoding="utf-8")
+    (skills / "HERMES.md").write_text("hermes-mark\n" + ("e" * 2900), encoding="utf-8")
+    (skills / "IDENTITY.md").write_text("i" * 1900, encoding="utf-8")
+    (skills / "SOUL.md").write_text("s" * 3100, encoding="utf-8")
+    (skills / "m11_security_audit.md").write_text(
+        "M11-START\n" + ("a" * 6000) + "\nM11-END", encoding="utf-8"
+    )
+
+    mgr = SkillManager(skills_dir=skills)
+
+    ctx = mgr.get_skill_context(command="check")
+
+    assert "hermes-mark" in ctx
+    assert "M11-START" in ctx
+    assert "M11-END" in ctx  # full m11 body, not partial-cut
