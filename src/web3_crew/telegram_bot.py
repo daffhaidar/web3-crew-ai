@@ -39,20 +39,49 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
+from web3 import Web3
 
 from web3_crew.config import settings
 from web3_crew.context_manager import ContextManager
 from web3_crew.crew import build_chat_crew, build_crew
 from web3_crew.memory.skill_ingestor import SkillManager
+from web3_crew.tools.eligibility import check_eligibility
+from web3_crew.tools.mint_phase import probe_mint_phase
+from web3_crew.tools.scheduled_executor import poll_loop
+from web3_crew.tools.scheduled_mint import (
+    ScheduledJob,
+    ScheduledMintQueue,
+    parse_schedule_time,
+)
 
 logger = logging.getLogger(__name__)
 
 # Inisialisasi Skill Manager (Dynamic Ingestion)
 _skill_manager = SkillManager()
 
+# Singleton queue for scheduled mints; created lazily so tests can override
+# the queue path via ScheduledMintQueue(queue_path=...) before this is
+# accessed.
+_scheduled_queue: ScheduledMintQueue | None = None
+
+
+def _get_scheduled_queue() -> ScheduledMintQueue:
+    global _scheduled_queue
+    if _scheduled_queue is None:
+        _scheduled_queue = ScheduledMintQueue()
+    return _scheduled_queue
+
+
 # Regex untuk mendeteksi EVM address di dalam kalimat natural.
 _ADDRESS_RE: Final[re.Pattern[str]] = re.compile(r"0x[a-fA-F0-9]{40}")
 _TX_HASH_RE: Final[re.Pattern[str]] = re.compile(r"0x[a-fA-F0-9]{64}")
+
+# Schedule directive in a natural-language mint message. Matches:
+#   ' @06:00 UTC'  ' @06:00'  ' @1715000000'  ' @+30m'  ' @+90s'  ' @+2h'
+_SCHEDULE_RE: Final[re.Pattern[str]] = re.compile(
+    r"@\s*(\+?\d+[smh]?|\d{1,2}:\d{2}(?:\s*UTC)?)",
+    flags=re.IGNORECASE,
+)
 
 _TELEGRAM_MAX_BODY: Final[int] = 3900
 _TELEGRAM_PLAIN_MAX: Final[int] = 4000
@@ -238,6 +267,161 @@ async def handle_skill_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.edit_text("[-] Gagal mengunduh file dari server Telegram.")
 
 
+async def _handle_phase_probe(
+    update: Update, address: str, user_input: str
+) -> None:
+    """Read-only mint phase + eligibility probe. No tx, no wallet use."""
+    try:
+        w3 = Web3(Web3.HTTPProvider(settings.web3_rpc_url))
+        user_addr_match = re.search(
+            r"(?<!0x[a-fA-F0-9])0x[a-fA-F0-9]{40}",
+            user_input.replace(address, "", 1),
+        )
+        user_addr = user_addr_match.group(0) if user_addr_match else None
+
+        if user_addr:
+            verdict = await asyncio.to_thread(
+                check_eligibility, w3, address, user_addr, requested_qty=1
+            )
+            summary = verdict.summary()
+            if verdict.phase_result is not None:
+                summary += "\n\n" + verdict.phase_result.summary()
+        else:
+            phase = await asyncio.to_thread(probe_mint_phase, w3, address)
+            summary = phase.summary()
+        await update.message.reply_text(
+            f"<pre>{html.escape(summary)}</pre>", parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        logger.exception("Phase probe failed for %s", address)
+        await update.message.reply_text("Phase probe gagal. Cek log server.")
+
+
+async def _handle_schedule_mint(
+    update: Update,
+    address: str,
+    user_input: str,
+    schedule_spec: str,
+) -> None:
+    """Parse 'mint N di 0x... @06:00 UTC' and enqueue."""
+    target_ts = parse_schedule_time(schedule_spec)
+    if target_ts is None:
+        await update.message.reply_text(
+            f"Format jadwal '{html.escape(schedule_spec)}' gak dikenal. "
+            "Contoh valid: @06:00 UTC, @+30m, @+90s, @1715000000."
+        )
+        return
+
+    # qty: look for "N kali", "N nft", "N qty" or first standalone integer 1-50
+    qty = 1
+    m = re.search(r"\b(\d{1,2})\s*(?:x|qty|kali|nft|piece|pcs)?\b", user_input.lower())
+    if m:
+        candidate = int(m.group(1))
+        if 1 <= candidate <= 50:
+            qty = candidate
+
+    # function_name: default publicMint. Allow override via "via mint(uint256)" etc.
+    fn_name = "publicMint"
+    fn_match = re.search(r"\bvia\s+(\w+)\b", user_input.lower())
+    if fn_match:
+        fn_name = fn_match.group(1)
+
+    # value_eth: look for "@0.0003 ETH" pattern (NOT the schedule @) or "value 0.001"
+    value_wei = 0
+    val_match = re.search(
+        r"(?:value|harga|price)[\s:=]*(\d*\.?\d+)\s*eth",
+        user_input.lower(),
+    )
+    if val_match:
+        value_wei = int(float(val_match.group(1)) * 1e18) * qty
+
+    queue = _get_scheduled_queue()
+    job = await queue.enqueue(
+        contract_address=address,
+        qty=qty,
+        scheduled_at=target_ts,
+        value_wei=value_wei,
+        function_name=fn_name,
+        user_id=update.effective_user.id,
+        chain_id=settings.chain_id,
+    )
+    delta = target_ts - int(__import__("time").time())
+    delta_str = f"T-{delta}s" if delta < 60 else f"T-{delta // 60}m{delta % 60:02d}s"
+    await update.message.reply_text(
+        f"<b>Scheduled mint job</b> <code>{job.id[:8]}</code>\n"
+        f"- contract: <code>{html.escape(address)}</code>\n"
+        f"- qty: <code>{qty}</code>\n"
+        f"- function: <code>{fn_name}</code>\n"
+        f"- value: <code>{value_wei / 1e18:.6f} ETH</code> total\n"
+        f"- fires at: <code>unix {target_ts}</code> ({delta_str})\n\n"
+        f"<i>Cancel: /cancel {job.id[:8]}. List: /scheduled.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def scheduled_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all scheduled mint jobs."""
+    queue = _get_scheduled_queue()
+    jobs = await queue.list_all()
+    if not jobs:
+        await update.message.reply_text("No scheduled mint jobs.")
+        return
+    active = [j for j in jobs if not j.is_terminal]
+    terminal = [j for j in jobs if j.is_terminal][-5:]  # last 5
+    lines: list[str] = []
+    if active:
+        lines.append("<b>Active</b>")
+        lines.extend(html.escape(j.summary_line()) for j in active)
+    if terminal:
+        lines.append("\n<b>Recent (last 5)</b>")
+        lines.extend(html.escape(j.summary_line()) for j in terminal)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel a scheduled job by id prefix: /cancel <id8>"""
+    if not context.args:
+        await update.message.reply_text("Usage: /cancel <job_id_prefix>")
+        return
+    queue = _get_scheduled_queue()
+    target = await queue.cancel(context.args[0])
+    if target is None:
+        await update.message.reply_text(f"Job '{context.args[0]}' tidak ditemukan.")
+        return
+    if target.status == "cancelled":
+        await update.message.reply_text(
+            f"Cancelled job <code>{target.id[:8]}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"Job <code>{target.id[:8]}</code> sudah {target.status}, tidak bisa cancel.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def _scheduled_notifier(job: ScheduledJob, emoji: str, msg: str) -> None:
+    """Send DM to the authorized user when a scheduled job completes."""
+    try:
+        from telegram import Bot
+
+        if not settings.telegram_bot_token or settings.authorized_user_id == 0:
+            return
+        bot = Bot(token=settings.telegram_bot_token)
+        await bot.send_message(
+            chat_id=settings.authorized_user_id,
+            text=(
+                f"<b>{emoji} Scheduled job {html.escape(job.id[:8])}</b>\n"
+                f"contract: <code>{html.escape(job.contract_address)}</code>\n"
+                f"qty: {job.qty}, fn: {html.escape(job.function_name)}\n"
+                f"{html.escape(msg)}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Failed to notify scheduled job %s", job.id[:8])
+
+
 async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Intelligent router yang menggantikan slash commands.
@@ -260,6 +444,25 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
     # -------------------------------------------------------------
     augmented_input_lower = user_input.lower()
     address = _extract_address_from_text(user_input)
+
+    # 0. ROUTING: PHASE PROBE (read-only, no tx)
+    _PHASE_KEYWORDS = (
+        "phase", "fase", "eligible", "eligibility",
+        "kapan buka", "kapan mulai", "info mint",
+    )
+    if address and any(kw in augmented_input_lower for kw in _PHASE_KEYWORDS):
+        await _handle_phase_probe(update, address, user_input)
+        return
+
+    # 1a. ROUTING: SCHEDULED MINT (mint + address + @<time>)
+    schedule_match = _SCHEDULE_RE.search(user_input)
+    if (
+        address
+        and schedule_match
+        and any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "buy"])
+    ):
+        await _handle_schedule_mint(update, address, user_input, schedule_match.group(1))
+        return
 
     # 1. ROUTING: MINT PIPELINE
     if address and any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "gas", "buy"]):
@@ -340,11 +543,37 @@ def build_application() -> Application:
     app.add_handler(TypeHandler(Update, _gatekeeper), group=-1)
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("scheduled", scheduled_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
     # Handler ZIP Upload
     app.add_handler(MessageHandler(filters.Document.ZIP, handle_skill_upload))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_router))
+
+    # Spawn the scheduled-mint poll loop alongside the bot's polling loop.
+    # post_init runs inside the same event loop as run_polling, so we can
+    # safely create_task here without a separate loop.
+    async def _post_init(application: Application) -> None:
+        queue = _get_scheduled_queue()
+        task = asyncio.create_task(
+            poll_loop(queue, notifier=_scheduled_notifier),
+            name="scheduled-mint-poller",
+        )
+        application.bot_data["scheduled_poller"] = task
+        logger.info("Scheduled-mint poller spawned (queue=%s)", queue.queue_path)
+
+    async def _post_shutdown(application: Application) -> None:
+        task = application.bot_data.get("scheduled_poller")
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.post_init = _post_init
+    app.post_shutdown = _post_shutdown
 
     return app
 
