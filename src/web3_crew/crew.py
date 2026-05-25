@@ -21,26 +21,24 @@ def build_crew(
     action: str = "mint",
     *,
     audit_only: bool = False,
+    force_execution: bool = False,
+    skill_context: str = "",  # KABEL BARU DITAMBAHKAN DI SINI
 ) -> Crew:
-    """Build a sequential crew for Web3 token analysis and (optionally) execution.
-
-    Pipeline:
-        1. Data Gatherer  → collects token metadata and liquidity data
-        2. Contract Auditor → analyzes source code and produces risk score
-        3. Transaction Executor → executes safe transaction (or rejects)
-
-    Args:
-        token_address: EVM contract address to analyze.
-        action: On-chain action the executor should attempt if audit passes
-            (ignored when ``audit_only=True``).
-        audit_only: When ``True``, build a 2-step crew that stops after the
-            Auditor produces its JSON risk report. Used by the Telegram
-            ``/check`` command, which must never trigger a transaction.
-    """
+    """Build a sequential crew for Web3 token analysis and (optionally) execution."""
     data_gatherer = create_data_gatherer()
     contract_auditor = create_contract_auditor()
+    
     gather_task = create_gather_task(data_gatherer, token_address)
     audit_task = create_audit_task(contract_auditor)
+
+    # -------------------------------------------------------------
+    # THE INJECTION PROTOCOL
+    # Suntik instruksi dari .md langsung ke deskripsi task agen
+    # -------------------------------------------------------------
+    if skill_context:
+        context_header = f"=== DYNAMIC SKILLS & RULES ===\n{skill_context}\n=============================\n\n"
+        gather_task.description = context_header + gather_task.description
+        audit_task.description = context_header + audit_task.description
 
     if audit_only:
         return Crew(
@@ -51,7 +49,10 @@ def build_crew(
         )
 
     tx_executor = create_tx_executor()
-    execute_task = create_execute_task(tx_executor, action)
+    execute_task = create_execute_task(tx_executor, action, force_execution=force_execution)
+
+    if skill_context:
+        execute_task.description = context_header + execute_task.description
 
     return Crew(
         agents=[data_gatherer, contract_auditor, tx_executor],
@@ -62,17 +63,7 @@ def build_crew(
 
 
 def build_chat_crew(user_input: str) -> Crew:
-    """Build a single-agent crew that answers a free-form chat request.
-
-    This is a completely separate pipeline from :func:`build_crew`: it uses
-    its own :func:`create_chat_agent` (SUPERAGENT persona) and its own task,
-    and shares only the LLM factory. The existing 3-agent audit/mint pipeline
-    is unaffected — its agents have distinct backstories so the SUPERAGENT
-    persona never leaks into ``/check`` or ``/mint`` output.
-
-    Args:
-        user_input: The user's natural-language request from ``/chat``.
-    """
+    """Build a single-agent crew that answers a free-form chat request."""
     chat_agent = create_chat_agent()
     chat_task = create_chat_task(chat_agent, user_input)
     return Crew(

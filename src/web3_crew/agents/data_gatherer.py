@@ -5,6 +5,7 @@ from crewai import Agent
 from web3_crew.llm import create_llm
 from web3_crew.tools.dex_screener import DexScreenerTool
 from web3_crew.tools.token_data_fetcher import TokenDataFetcherTool
+from web3_crew.tools.advanced_scraper import AdvancedScrapeTool
 
 
 def create_data_gatherer() -> Agent:
@@ -13,16 +14,16 @@ def create_data_gatherer() -> Agent:
         goal=(
             "Collect comprehensive on-chain and off-chain data about a token project, "
             "including contract source code, ABI, deployer info, total supply, "
-            "and DEX liquidity data."
+            "DEX liquidity data, and extracting smart contract addresses directly from project websites."
         ),
         backstory=(
             "You are an expert blockchain researcher who specializes in gathering "
             "intelligence about token projects. You know how to pull data from "
-            "block explorers and DEX aggregators to build a complete picture of "
-            "any token's on-chain footprint. Your research is thorough and "
-            "structured, providing the foundation for security analysis."
+            "block explorers, DEX aggregators, and use headless browsers to scrape project websites. "
+            "This builds a complete picture of any token's footprint. "
+            "Your research is thorough and structured, providing the foundation for security analysis."
         ),
-        tools=[TokenDataFetcherTool(), DexScreenerTool()],
+        tools=[TokenDataFetcherTool(), DexScreenerTool(), AdvancedScrapeTool()],
         llm=create_llm(),
         verbose=True,
         allow_delegation=False,
