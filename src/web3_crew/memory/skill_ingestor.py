@@ -39,7 +39,36 @@ class SkillManager:
 
     ALLOWED_EXTENSIONS: Final[set[str]] = {".md", ".txt"}
     FORBIDDEN_EXTENSIONS: Final[set[str]] = {".py", ".sh", ".exe", ".bat", ".bin"}
-    MAX_CONTEXT_CHARS: Final[int] = 4000
+    # Hard cap on injected skill context. Cerebras gpt-oss-120b has an 8192
+    # token (~32K char) total budget, of which roughly half must stay free for
+    # tool calls, agent reasoning, and user input. 12K characters ≈ 3K tokens
+    # of skill priming — enough to fit the 3 identity files + one m-skill, and
+    # still leave headroom. Per-command filtering (see ``get_skill_context``)
+    # is what keeps us inside this budget when many m-skills are installed.
+    MAX_CONTEXT_CHARS: Final[int] = 12000
+
+    # Always-on identity files. These short character / heartbeat documents
+    # load on every invocation regardless of command — they are the bot's
+    # voice and survival instincts. Anything else (the ``m*_*.md`` skill
+    # modules) only loads when the ``command`` hint matches.
+    IDENTITY_FILE_PREFIXES: Final[tuple[str, ...]] = (
+        "HEARTBEAT",
+        "IDENTITY",
+        "SOUL",
+    )
+
+    # Mapping from command (``mint`` / ``check`` / ``chat`` / ...) to the
+    # ``m*`` skill prefixes that should be loaded on top of the identity
+    # files. This is the lightweight version of the AGENTS.md keyword router
+    # — deterministic per-command rather than per-token weighted.
+    #
+    # When extending: add new ``mXX_topic.md`` files to ``memory/skills/``,
+    # then add the prefix here under whichever command should pull it.
+    COMMAND_SKILL_MAP: Final[dict[str, tuple[str, ...]]] = {
+        "mint": ("m10", "m13"),    # Web3 ops + universal NFT minter
+        "check": ("m11",),         # Security / audit playbook
+        "chat": ("m4",),           # Telegram bot ops (general assistant)
+    }
 
     def __init__(self, skills_dir: Path | None = None) -> None:
         """Initialize SkillManager with skills directory.
@@ -172,20 +201,34 @@ class SkillManager:
 
         return extracted_count
 
-    def get_skill_context(self) -> str:
-        """Retrieve concatenated content of all skill files.
+    def get_skill_context(self, command: str | None = None) -> str:
+        """Retrieve concatenated content of relevant skill files.
+
+        The identity files (``HEARTBEAT.md`` / ``IDENTITY.md`` / ``SOUL.md``)
+        always load. When ``command`` is one of the keys in
+        :attr:`COMMAND_SKILL_MAP` (``"mint"``, ``"check"``, ``"chat"``, ...)
+        the matching ``m*`` skill files are also loaded on top — this is the
+        lightweight skill-router implementation from AGENTS.md. When
+        ``command`` is ``None`` or unrecognized, everything in the skills
+        directory is loaded (backward-compatible default).
+
+        Args:
+            command: optional command name to filter on. Use ``"mint"``,
+                ``"check"``, or ``"chat"`` to load only that pipeline's
+                relevant skills. Pass ``None`` to load every skill file
+                (legacy behavior).
 
         Returns:
             Formatted string with all skill content, or empty string
-            if no skills exist or on error. Format:
+            if no skills exist or on error. Format::
 
-            === filename1.md ===
-            [content]
+                === filename1.md ===
+                [content]
 
-            === filename2.md ===
-            [content]
+                === filename2.md ===
+                [content]
 
-            [TRUNCATED: Context exceeded 4000 characters]
+                [TRUNCATED: Context exceeded MAX_CONTEXT_CHARS]
         """
         try:
             # Check if skills directory exists
@@ -194,13 +237,15 @@ class SkillManager:
                 return ""
 
             # Collect all skill files
-            skill_files = []
+            all_skill_files: list[Path] = []
             for ext in self.ALLOWED_EXTENSIONS:
-                skill_files.extend(self.SKILLS_DIR.glob(f"*{ext}"))
+                all_skill_files.extend(self.SKILLS_DIR.glob(f"*{ext}"))
 
-            if not skill_files:
+            if not all_skill_files:
                 logger.debug("No skill files found")
                 return ""
+
+            skill_files = self._filter_for_command(all_skill_files, command)
 
             # Sort for consistent ordering
             skill_files.sort()
@@ -222,7 +267,7 @@ class SkillManager:
                     if total_chars + len(formatted) > self.MAX_CONTEXT_CHARS:
                         # Add truncation notice
                         context_parts.append(
-                            "\n[TRUNCATED: Context exceeded 4000 characters]"
+                            f"\n[TRUNCATED: Context exceeded {self.MAX_CONTEXT_CHARS} characters]"
                         )
                         break
 
@@ -240,3 +285,39 @@ class SkillManager:
         except Exception as e:
             logger.error("Failed to retrieve skill context: %s", e, exc_info=True)
             return ""
+
+    def _filter_for_command(
+        self,
+        files: list[Path],
+        command: str | None,
+    ) -> list[Path]:
+        """Pick which skill files to load for a given command.
+
+        Identity files always pass through. ``m*`` skill files only pass
+        through when their ``mNN_`` (or ``mNN.``) prefix is listed under
+        ``command`` in :attr:`COMMAND_SKILL_MAP`. Unknown commands and
+        ``None`` fall back to "load everything" so the legacy single-call
+        site keeps working.
+        """
+        if command is None or command not in self.COMMAND_SKILL_MAP:
+            return list(files)
+
+        allowed_prefixes = self.COMMAND_SKILL_MAP[command]
+
+        def _is_identity(name: str) -> bool:
+            stem = Path(name).stem.upper()
+            return any(stem.startswith(p) for p in self.IDENTITY_FILE_PREFIXES)
+
+        def _matches_command(name: str) -> bool:
+            stem = Path(name).stem
+            return any(
+                stem == prefix
+                or stem.startswith(f"{prefix}_")
+                or stem.startswith(f"{prefix}.")
+                for prefix in allowed_prefixes
+            )
+
+        return [
+            f for f in files
+            if _is_identity(f.name) or _matches_command(f.name)
+        ]
