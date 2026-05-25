@@ -133,7 +133,7 @@ def _format_report(payload: str) -> str:
 
         text = json.dumps(parsed, indent=2, ensure_ascii=False)
     except (ValueError, TypeError):
-        pass  
+        pass
 
     if len(text) > _TELEGRAM_MAX_BODY:
         text = text[:_TELEGRAM_MAX_BODY] + "\n...(truncated)"
@@ -159,7 +159,7 @@ def _format_chat_reply(payload: str) -> str:
     return text
 
 async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE, *, crew) -> str:
-    chat_id = update.effective_chat.id  
+    chat_id = update.effective_chat.id
 
     async def _heartbeat() -> None:
         try:
@@ -203,28 +203,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "- <i>'Coy, jelasin cara bypass gas war'</i> (Otomatis Chat)\n"
         "- <i>Kirim file ZIP berisi file .md untuk ingest skill baru.</i>"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)  
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def handle_skill_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handler for ZIP document uploads to ingest skills."""
     document = update.message.document
     msg = await update.message.reply_text("[*] Mengunduh dan memvalidasi file ZIP...", parse_mode=ParseMode.HTML)
-    
+
     try:
         file = await context.bot.get_file(document.file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
             tmp_path = Path(tmp.name)
-        
+
         await file.download_to_drive(custom_path=tmp_path)
-        
+
         try:
             count = _skill_manager.process_zip(tmp_path)
             if count > 0:
                 await msg.edit_text(f"[+] Skill di-install. Total {count} file .md/.txt diserap.")
             else:
                 await msg.edit_text("[-] Tidak ada file valid ditemukan di dalam ZIP.")
-        except ValueError as e:
+        except ValueError:
             await msg.edit_text("[!] Upload ditolak: file berbahaya terdeteksi (.py, .sh, dll).")
         except Exception as e:
             logger.exception("Failed to process ZIP")
@@ -232,8 +232,8 @@ async def handle_skill_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
-                
-    except Exception as e:
+
+    except Exception:
         logger.exception("Failed to download ZIP from Telegram")
         await msg.edit_text("[-] Gagal mengunduh file dari server Telegram.")
 
@@ -243,8 +243,8 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
     Intelligent router yang menggantikan slash commands.
     Membaca input natural dari user dan memicu pipeline yang tepat.
     """
-    user_input = update.message.text.strip()  
-    user_id = update.effective_user.id  
+    user_input = update.message.text.strip()
+    user_id = update.effective_user.id
 
     augmented_input = ContextManager.get_augmented_input(
         context.user_data,
@@ -254,17 +254,18 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
 
     # -------------------------------------------------------------
     # CONTEXT INJECTION
-    # Menyuntikkan skill context ke dalam augmented_input
+    # Per-command skill routing: identity files always load, and only the
+    # m-skills relevant to the chosen pipeline get pulled in. See
+    # SkillManager.COMMAND_SKILL_MAP for the prefix-to-command mapping.
     # -------------------------------------------------------------
-    skill_context = _skill_manager.get_skill_context()
-    if skill_context:
-        augmented_input = f"{skill_context}\n\n{augmented_input}"
-
     augmented_input_lower = user_input.lower()
     address = _extract_address_from_text(user_input)
 
     # 1. ROUTING: MINT PIPELINE
     if address and any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "gas", "buy"]):
+        skill_context = _skill_manager.get_skill_context(command="mint")
+        if skill_context:
+            augmented_input = f"{skill_context}\n\n{augmented_input}"
         await update.message.reply_text(
             f"Eksekusi MINT pipeline untuk <code>{html.escape(address)}</code>...\nExecutor standby menunggu hasil audit.",
             parse_mode=ParseMode.HTML,
@@ -289,6 +290,7 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
 
     # 2. ROUTING: AUDIT PIPELINE
     if address and any(keyword in user_input.lower() for keyword in ["cek", "check", "audit", "liat", "aman"]):
+        skill_context = _skill_manager.get_skill_context(command="check")
         await update.message.reply_text(
             f"Scanning audit untuk <code>{html.escape(address)}</code>... (30-90s).",
             parse_mode=ParseMode.HTML,
@@ -306,6 +308,9 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
         return
 
     # 3. ROUTING: SUPERAGENT CHAT
+    skill_context = _skill_manager.get_skill_context(command="chat")
+    if skill_context:
+        augmented_input = f"{skill_context}\n\n{augmented_input}"
     await update.message.reply_text("SUPERAGENT processing... (10-30s)")
     try:
         crew = build_chat_crew(augmented_input)
