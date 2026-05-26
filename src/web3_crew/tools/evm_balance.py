@@ -55,9 +55,8 @@ class EVMBalanceCheckerTool(BaseTool):
                     last_error = f"Tidak dapat terhubung ke RPC {rpc_url}"
                     continue
 
-                balance_wei = w3.eth.get_balance(
-                    Web3.to_checksum_address(wallet_address)
-                )
+                checksum_address = Web3.to_checksum_address(wallet_address)
+                balance_wei = w3.eth.get_balance(checksum_address)
                 balance_eth = w3.from_wei(balance_wei, "ether")
                 balance_rounded = round(float(balance_eth), 4)
 
