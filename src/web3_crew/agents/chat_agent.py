@@ -24,7 +24,7 @@ from crewai import Agent
 from crewai_tools import ScrapeWebsiteTool
 
 from web3_crew.llm import create_llm
-from web3_crew.tools import EVMBalanceCheckerTool
+from web3_crew.tools.evm_balance import EVMBalanceCheckerTool
 from web3_crew.tools.skill_router import SkillRouterTool
 
 # Fallback persona used if .agents/persona/*.md is missing. Kept short to
