@@ -1,3 +1,4 @@
+import os
 import re
 from typing import Type
 
@@ -5,11 +6,20 @@ from crewai.tools import BaseTool
 from pydantic import BaseModel
 from web3 import Web3
 
-# Public Ethereum RPC endpoints (tried in order)
-_RPC_URLS = [
-    "https://eth.llamarpc.com",
-    "https://cloudflare-eth.com",
+# Private Alchemy RPC (highest priority — loaded from environment)
+_ALCHEMY_RPC_URL = os.getenv("ALCHEMY_RPC_URL")
+
+# Public fallback RPC endpoints (tried in order if Alchemy is unavailable)
+_PUBLIC_RPC_URLS = [
+    "https://eth.drpc.org",
+    "https://ethereum-rpc.publicnode.com",
+    "https://rpc.mevblocker.io",
 ]
+
+# Assemble final list: Alchemy first (if set), then public fallbacks
+_RPC_URLS: list[str] = (
+    [_ALCHEMY_RPC_URL] + _PUBLIC_RPC_URLS if _ALCHEMY_RPC_URL else _PUBLIC_RPC_URLS
+)
 
 # Common browser User-Agent to avoid Cloudflare/RPC firewall blocks
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
