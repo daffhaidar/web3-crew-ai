@@ -24,6 +24,7 @@ import html
 import json
 import logging
 import re
+import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Final
@@ -57,6 +58,55 @@ from web3_crew.tools.scheduled_mint import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQLite User Logging
+# ---------------------------------------------------------------------------
+_DB_PATH: Final[Path] = Path(__file__).resolve().parent.parent.parent / "bot_users.db"
+
+
+def _init_user_db() -> None:
+    """Create the user-log table if it does not already exist."""
+    conn = sqlite3.connect(_DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_users (
+                chat_id    INTEGER PRIMARY KEY,
+                username   TEXT,
+                first_seen TEXT DEFAULT (datetime('now')),
+                last_seen  TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _log_user_chat_id(chat_id: int, username: str | None = None) -> None:
+    """Upsert a user's chat ID so we track first and last interaction."""
+    conn = sqlite3.connect(_DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO bot_users (chat_id, username, first_seen, last_seen)
+            VALUES (?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(chat_id) DO UPDATE SET
+                username  = COALESCE(excluded.username, bot_users.username),
+                last_seen = datetime('now')
+            """,
+            (chat_id, username),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        logger.exception("Failed to log chat_id=%s to SQLite", chat_id)
+    finally:
+        conn.close()
+
+
+# Run once at import time so the table is ready before any handler fires.
+_init_user_db()
 
 # Inisialisasi Skill Manager (Dynamic Ingestion)
 _skill_manager = SkillManager()
@@ -100,6 +150,12 @@ async def _gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         sender_id = user.id if user else "anonymous"
         logger.warning("Dropping update from unauthorized sender id=%s", sender_id)
         raise ApplicationHandlerStop
+
+    # Log authorized user interaction to SQLite
+    _log_user_chat_id(
+        chat_id=user.id,
+        username=user.username or user.first_name,
+    )
 
 
 # ---------------------------------------------------------------------------
