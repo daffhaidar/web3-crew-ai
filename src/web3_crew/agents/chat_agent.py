@@ -19,13 +19,17 @@ missing or renamed.
 from __future__ import annotations
 from datetime import datetime
 
+import os
 from pathlib import Path
 
 from crewai import Agent
+from crewai.tools import tool
 from crewai_tools import ScrapeWebsiteTool
+from web3 import Web3
 
 from web3_crew.llm import create_llm
 from web3_crew.tools.evm_balance import EVMBalanceCheckerTool
+from web3_crew.tools.mint_phase import probe_mint_phase
 from web3_crew.tools.skill_router import SkillRouterTool
 
 # Fallback persona used if .agents/persona/*.md is missing. Kept short to
@@ -37,6 +41,46 @@ _FALLBACK_PERSONA = (
     "2) Never use AI fluff like 'Berikut penjelasannya' or formal words like 'kamu'. 3) ONLY generate code or execute if explicitly asked or given an address/link. "
     "No moralizing, no disclaimers — except for extreme hard stops (minors/WMD)."
 )
+
+
+# ---------------------------------------------------------------------------
+# Web3 helper for tools that need on-chain access
+# ---------------------------------------------------------------------------
+
+_w3_instance: Web3 | None = None
+
+
+def _get_web3() -> Web3:
+    """Return a shared Web3 instance, lazy-initialised from ``ETH_RPC_URL``."""
+    global _w3_instance
+    if _w3_instance is None:
+        rpc_url = os.environ.get("ETH_RPC_URL", "https://eth.llamarpc.com")
+        _w3_instance = Web3(Web3.HTTPProvider(rpc_url))
+    return _w3_instance
+
+
+# ---------------------------------------------------------------------------
+# CrewAI @tool wrappers
+# ---------------------------------------------------------------------------
+
+
+@tool("mint_phase_probe")
+def mint_phase_probe(contract_address: str, user_address: str = "") -> str:
+    """Probe the minting status of an NFT contract (is it open, price, supply, etc) without executing transactions.
+
+    Args:
+        contract_address: The NFT contract address to probe (checksummed or lowercased).
+        user_address: Optional wallet address to check per-wallet minted counts.
+    """
+    w3 = _get_web3()
+    user_addr = user_address.strip() or None
+    result = probe_mint_phase(w3, contract_address, user_address=user_addr)
+    return result.summary()
+
+
+# ---------------------------------------------------------------------------
+# Persona loading
+# ---------------------------------------------------------------------------
 
 
 def _default_persona_dir() -> Path:
@@ -101,12 +145,19 @@ def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") 
             "scrape_website tool to extract content from any URLs provided by "
             "the user. Use the EVMBalanceCheckerTool to validate and check the "
             "simulated balance of any EVM wallet address provided by the user. "
+            "Use the mint_phase_probe tool to check whether an NFT contract's "
+            "minting is open, its price, supply, and per-wallet caps. "
             "For Web3 questions about THIS bot itself, the "
             "skill_router will surface the matching repo skill — synthesize "
             "from it, do not paste it raw."
         ),
         backstory=full_backstory,
-        tools=[SkillRouterTool(), ScrapeWebsiteTool(), EVMBalanceCheckerTool()],
+        tools=[
+            SkillRouterTool(),
+            ScrapeWebsiteTool(),
+            EVMBalanceCheckerTool(),
+            mint_phase_probe,
+        ],
         llm=create_llm(),
         verbose=True,
         allow_delegation=False,
