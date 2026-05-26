@@ -135,6 +135,14 @@ _SCHEDULE_RE: Final[re.Pattern[str]] = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Keywords that indicate a balance / saldo query.  When these appear
+# together with an EVM address the request is routed to the ChatAgent
+# instead of the audit pipeline so it can call the balance tool directly.
+_BALANCE_KEYWORDS: Final[tuple[str, ...]] = (
+    "saldo", "balance", "cek saldo", "check balance",
+    "cek balance", "check saldo",
+)
+
 _TELEGRAM_MAX_BODY: Final[int] = 3900
 _TELEGRAM_PLAIN_MAX: Final[int] = 4000
 
@@ -622,7 +630,29 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
     augmented_input_lower = user_input.lower()
     address = _extract_address_from_text(user_input)
 
-    # 0. ROUTING: PHASE PROBE (read-only, no tx)
+    # 0. ROUTING: BALANCE / SALDO CHECK
+    #    If the user mentions a wallet address together with balance-related
+    #    keywords (saldo, balance, cek saldo, ...), skip audit/mint entirely
+    #    and let the ChatAgent (SUPERAGENT) handle it with the balance tool.
+    if address and any(kw in augmented_input_lower for kw in _BALANCE_KEYWORDS):
+        skill_context = _skill_manager.get_skill_context(command="chat")
+        await update.message.reply_text(
+            f"[*] Mengecek saldo untuk <code>{html.escape(address)}</code>...",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            crew = build_chat_crew(augmented_input, skill_context=skill_context)
+            result = await _run_with_heartbeat(update, context, crew=crew)
+            bot_reply = _format_chat_reply(result)
+            await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
+
+            ContextManager.store_exchange(context.user_data, user_input, bot_reply, user_id)
+        except Exception:
+            logger.exception("Balance check pipeline failed for %s", address)
+            await update.message.reply_text("Gagal cek saldo. Cek log server.")
+        return
+
+    # 0b. ROUTING: PHASE PROBE (read-only, no tx)
     _PHASE_KEYWORDS = (
         "phase", "fase", "eligible", "eligibility",
         "kapan buka", "kapan mulai", "info mint",
