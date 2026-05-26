@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Final
 
 from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackQueryHandler
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -112,6 +114,14 @@ def _extract_address_from_text(text: str) -> str | None:
 def _format_report(payload: str) -> str:
     """Format audit report dari JSON mentah menjadi tampilan Telegram."""
     text = payload.strip()
+    
+    # Trik variabel agar tidak merusak tampilan markdown AI
+    simbol_kutip = "`" * 3
+    
+    # KUPAS BUNGKUS MARKDOWN: Hapus bungkus json di awal dan akhir
+    text = re.sub(r'^' + simbol_kutip + r'(?:json)?\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*' + simbol_kutip + r'$', '', text)
+    
     try:
         parsed = json.loads(text)
 
@@ -177,13 +187,18 @@ def _format_chat_reply(payload: str) -> str:
     if len(text) > limit:
         text = text[:limit] + "\n...(truncated)"
 
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'^\|?[\s\-:]+\|[\s\-:\|]+\|?$', '', text, flags=re.MULTILINE)
+    # 1. Escape karakter HTML bawaan biar kaga bentrok dengan Telegram parser
     text = html.escape(text)
 
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
-    text = re.sub(r'(?<!\*)\*([^\*]+)\*(?!\*)', r'<i>\1</i>', text)
+    # 2. Parse Code Blocks (Triple Backticks) DULUAN
+    # Menangkap ```javascript\nkode\n``` atau ```kode``` dan mengubahnya jadi <pre>
+    text = re.sub(r'```[a-zA-Z0-9]*\n?(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+
+    # 3. Parse Inline Code (Single Backtick)
     text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+
+    # 4. Parse Bold
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
 
     return text
 
@@ -199,8 +214,26 @@ async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
     heartbeat = asyncio.create_task(_heartbeat())
+    
     try:
-        result = await asyncio.to_thread(crew.kickoff)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Coba eksekusi Crew
+                result = await asyncio.to_thread(crew.kickoff)
+                break  # Kalau sukses, keluar dari loop
+            except Exception as e:
+                error_msg = str(e)
+                # Deteksi error 503 atau Service Unavailable
+                if "503" in error_msg or "ServiceUnavailable" in error_msg:
+                    if attempt < max_retries - 1:
+                        await update.message.reply_text(
+                            f"[!] Otak AI sibuk (Error 503). Retrying otomatis {attempt + 1}/{max_retries} dalam 5 detik..."
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                # Kalau bukan 503 atau jatah retry abis, lempar errornya
+                raise e
     finally:
         heartbeat.cancel()
         try:
@@ -236,35 +269,123 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def handle_skill_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler for ZIP document uploads to ingest skills."""
     document = update.message.document
     msg = await update.message.reply_text("[*] Mengunduh dan memvalidasi file ZIP...", parse_mode=ParseMode.HTML)
-
+    
     try:
         file = await context.bot.get_file(document.file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
-            tmp_path = Path(tmp.name)
-
+        # Jangan gunakan context manager 'with' agar file tidak otomatis terhapus saat error
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        
         await file.download_to_drive(custom_path=tmp_path)
-
+        
         try:
             count = _skill_manager.process_zip(tmp_path)
-            if count > 0:
-                await msg.edit_text(f"[+] Skill di-install. Total {count} file .md/.txt diserap.")
-            else:
-                await msg.edit_text("[-] Tidak ada file valid ditemukan di dalam ZIP.")
+            await msg.edit_text(f"[+] Skill di-install. Total {count} file diserap.")
+            tmp_path.unlink(missing_ok=True)
+            
         except ValueError:
-            await msg.edit_text("[!] Upload ditolak: file berbahaya terdeteksi (.py, .sh, dll).")
+            # File berbahaya terdeteksi. Munculkan tombol Bypass.
+            context.user_data['pending_zip'] = str(tmp_path)
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("Gas, Bypass!", callback_data="bypass_zip_yes"),
+                    InlineKeyboardButton("Batal", callback_data="bypass_zip_no")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await msg.edit_text(
+                "?? <b>PERINGATAN SISTEM</b>\n"
+                "File berbahaya (.py, .sh, dll) terdeteksi di dalam ZIP. Ini berbahaya? Mau lanjutin?",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+            
         except Exception as e:
-            logger.exception("Failed to process ZIP")
-            await msg.edit_text(f"[!] File ZIP rusak atau sistem gagal mengekstrak: {e}")
-        finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
-
-    except Exception:
-        logger.exception("Failed to download ZIP from Telegram")
-        await msg.edit_text("[-] Gagal mengunduh file dari server Telegram.")
+            await msg.edit_text(f"[!] File ZIP rusak atau gagal diekstrak: {e}")
+            tmp_path.unlink(missing_ok=True)
+            
+    except Exception as e:
+        logger.exception("Failed to download ZIP")
+        await msg.edit_text("[-] Gagal mengunduh file.")
+        
+        
+async def handle_zip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    
+    tmp_path_str = context.user_data.get('pending_zip')
+    if not tmp_path_str:
+        await query.edit_message_text("[-] Sesi upload kadaluarsa.")
+        return
+        
+    tmp_path = Path(tmp_path_str)
+    
+    if query.data == "bypass_zip_yes":
+        await query.edit_message_text("[*] Memaksa eksekusi file...")
+        try:
+            # Panggil dengan force=True
+            count = _skill_manager.process_zip(tmp_path, force=True)
+            await query.edit_message_text(f"Yaudah oke gue eksekusi yaa.. DYOR oke. Total {count} file diserap.")
+        except Exception as e:
+            await query.edit_message_text(f"[!] Bypass gagal: {e}")
+    else:
+        await query.edit_message_text("[-] Eksekusi dibatalkan demi keamanan.")
+        
+    # Cleanup
+    tmp_path.unlink(missing_ok=True)
+    context.user_data.pop('pending_zip', None)
+    
+async def handle_mint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menangani klik tombol konfirmasi MINT."""
+    query = update.callback_query
+    await query.answer()
+    
+    address = context.user_data.get('pending_mint_address')
+    skill_context = context.user_data.get('pending_mint_skill', "")
+    
+    if not address:
+        await query.edit_message_text("[-] Sesi konfirmasi kadaluarsa atau tidak valid.")
+        return
+        
+    if query.data == "confirm_mint_yes":
+        await query.edit_message_text(
+            f"?? <b>Mengeksekusi transaksi on-chain untuk</b> <code>{html.escape(address)}</code>...", 
+            parse_mode=ParseMode.HTML
+        )
+        try:
+            # Eksekusi Penuh (Bypass Audit karena udah diaudit sebelumnya)
+            crew = build_crew(
+                token_address=address, 
+                action="mint", 
+                audit_only=False, 
+                force_execution=True, 
+                skill_context=skill_context
+            )
+            result = await _run_with_heartbeat(update, context, crew=crew)
+            
+            tx_hash_match = _TX_HASH_RE.search(result)
+            if tx_hash_match:
+                tx_hash = tx_hash_match.group(0)
+                bot_reply = f"<b>TxHash</b>: <code>{tx_hash}</code>\n\n{_format_report(result)}"
+            else:
+                bot_reply = _format_report(result)
+                
+            await query.edit_message_text(bot_reply, parse_mode=ParseMode.HTML)
+            
+        except Exception as e:
+            logger.exception("Mint execution failed")
+            await query.edit_message_text(f"[-] Eksekusi gagal: {e}")
+    else:
+        await query.edit_message_text(f"[!] Eksekusi <b>dibatalkan</b> oleh operator. Dana aman.", parse_mode=ParseMode.HTML)
+        
+    # Bersihkan memori sesi
+    context.user_data.pop('pending_mint_address', None)
+    context.user_data.pop('pending_mint_skill', None)
 
 
 async def _handle_phase_probe(
@@ -467,28 +588,40 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
     # 1. ROUTING: MINT PIPELINE
     if address and any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "gas", "buy"]):
         skill_context = _skill_manager.get_skill_context(command="mint")
-        if skill_context:
-            augmented_input = f"{skill_context}\n\n{augmented_input}"
-        await update.message.reply_text(
-            f"Eksekusi MINT pipeline untuk <code>{html.escape(address)}</code>...\nExecutor standby menunggu hasil audit.",
+        msg = await update.message.reply_text(
+            f"[*] Mempersiapkan MINT pipeline untuk <code>{html.escape(address)}</code>...\nMelakukan audit pra-eksekusi...",
             parse_mode=ParseMode.HTML,
         )
         try:
-            crew = build_crew(token_address=address, action="mint", audit_only=False, skill_context=skill_context)
-            result = await _run_with_heartbeat(update, context, crew=crew)
-            tx_hash_match = _TX_HASH_RE.search(result)
-            if tx_hash_match:
-                tx_hash = tx_hash_match.group(0)
-                bot_reply = f"<b>TxHash</b>: <code>{tx_hash}</code>\n\n{_format_report(result)}"
-                await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
-            else:
-                bot_reply = _format_report(result)
-                await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
-
-            ContextManager.store_exchange(context.user_data, user_input, bot_reply, user_id)
+            # Jalankan Audit Dulu
+            crew = build_crew(token_address=address, audit_only=True, skill_context=skill_context)
+            audit_result = await _run_with_heartbeat(update, context, crew=crew)
+            audit_report = _format_report(audit_result)
+            
+            # Simpan state untuk eksekusi
+            context.user_data['pending_mint_address'] = address
+            context.user_data['pending_mint_skill'] = skill_context
+            
+            # Buat Tombol Rem Darurat
+            keyboard = [
+                [
+                    InlineKeyboardButton("[!] TANDA TANGANI & GAS", callback_data="confirm_mint_yes"),
+                    InlineKeyboardButton("[X] BATALKAN", callback_data="confirm_mint_no")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await msg.edit_text(
+                f"{audit_report}\n\n[!] <b>OTORISASI EKSEKUSI</b>\nApakah lu yakin mau mengeksekusi transaksi untuk kontrak ini?",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Simpan log interaksi
+            ContextManager.store_exchange(context.user_data, user_input, audit_report, user_id)
         except Exception:
-            logger.exception("Mint pipeline failed for %s", address)
-            await update.message.reply_text("Mint pipeline gagal. Cek log server.")
+            logger.exception("Mint pipeline audit failed for %s", address)
+            await msg.edit_text("[-] Audit pra-eksekusi gagal. Cek log server.")
         return
 
     # 2. ROUTING: AUDIT PIPELINE
@@ -512,11 +645,9 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
 
     # 3. ROUTING: SUPERAGENT CHAT
     skill_context = _skill_manager.get_skill_context(command="chat")
-    if skill_context:
-        augmented_input = f"{skill_context}\n\n{augmented_input}"
     await update.message.reply_text("SUPERAGENT processing... (10-30s)")
     try:
-        crew = build_chat_crew(augmented_input)
+        crew = build_chat_crew(augmented_input, skill_context=skill_context)
         result = await _run_with_heartbeat(update, context, crew=crew)
         bot_reply = _format_chat_reply(result)
         await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
@@ -543,37 +674,14 @@ def build_application() -> Application:
     app.add_handler(TypeHandler(Update, _gatekeeper), group=-1)
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("scheduled", scheduled_command))
-    app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Handler ZIP Upload
+    # Handler ZIP Upload & Tombolnya (TARUH DI SINI)
     app.add_handler(MessageHandler(filters.Document.ZIP, handle_skill_upload))
+    app.add_handler(CallbackQueryHandler(handle_zip_callback, pattern="^bypass_zip_"))
+    app.add_handler(CallbackQueryHandler(handle_mint_callback, pattern="^confirm_mint_"))
 
+    # Router NLP harus di bawah supaya kaga nabrak command lain
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_router))
-
-    # Spawn the scheduled-mint poll loop alongside the bot's polling loop.
-    # post_init runs inside the same event loop as run_polling, so we can
-    # safely create_task here without a separate loop.
-    async def _post_init(application: Application) -> None:
-        queue = _get_scheduled_queue()
-        task = asyncio.create_task(
-            poll_loop(queue, notifier=_scheduled_notifier),
-            name="scheduled-mint-poller",
-        )
-        application.bot_data["scheduled_poller"] = task
-        logger.info("Scheduled-mint poller spawned (queue=%s)", queue.queue_path)
-
-    async def _post_shutdown(application: Application) -> None:
-        task = application.bot_data.get("scheduled_poller")
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-    app.post_init = _post_init
-    app.post_shutdown = _post_shutdown
 
     return app
 
