@@ -65,15 +65,26 @@ def load_persona(persona_dir: Path | None = None) -> str:
     return "\n\n".join(parts)
 
 
-def create_chat_agent(persona_dir: Path | None = None) -> Agent:
-    """Build the SUPERAGENT-persona ChatAgent.
+def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") -> Agent:
+    """Build the SUPERAGENT-persona ChatAgent with dynamic context support.
 
     The agent has two tools: skill_router for domain-specific knowledge and
-    scrape_website for extracting content from URLs. The persona is injected
-    into ``backstory`` so it is honored across every interaction without any
-    per-call prompt engineering.
+    scrape_website for extracting content from URLs. The persona and dynamic 
+    skills are injected directly into ``backstory`` to form its core identity.
     """
-    persona = load_persona(persona_dir)
+    base_persona = load_persona(persona_dir)
+    
+    # Masukkan dynamic skills langsung ke DNA backstory jika ada data masuk
+    if skill_context:
+        full_backstory = (
+            f"{base_persona}\n\n"
+            f"=== CRITICAL CURRENT CORE PERSONA EXTENSION (DYNAMIC SKILLS) ===\n"
+            f"{skill_context}\n"
+            f"================================================================"
+        )
+    else:
+        full_backstory = base_persona
+
     return Agent(
         role="SUPERAGENT — General Execution Agent",
         goal=(
@@ -87,7 +98,7 @@ def create_chat_agent(persona_dir: Path | None = None) -> Agent:
             "skill_router will surface the matching repo skill — synthesize "
             "from it, do not paste it raw."
         ),
-        backstory=persona,
+        backstory=full_backstory,
         tools=[SkillRouterTool(), ScrapeWebsiteTool()],
         llm=create_llm(),
         verbose=True,
