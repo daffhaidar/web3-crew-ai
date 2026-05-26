@@ -24,6 +24,7 @@ from crewai import Agent
 from crewai_tools import ScrapeWebsiteTool
 
 from web3_crew.llm import create_llm
+from web3_crew.tools import EVMBalanceCheckerTool
 from web3_crew.tools.skill_router import SkillRouterTool
 
 # Fallback persona used if .agents/persona/*.md is missing. Kept short to
@@ -94,12 +95,14 @@ def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") 
             "specialized area (server, monetize, content, automation, data, "
             "API, AI, files, frontend, audit, strategy, debug). Use the "
             "scrape_website tool to extract content from any URLs provided by "
-            "the user. For Web3 questions about THIS bot itself, the "
+            "the user. Use the EVMBalanceCheckerTool to validate and check the "
+            "simulated balance of any EVM wallet address provided by the user. "
+            "For Web3 questions about THIS bot itself, the "
             "skill_router will surface the matching repo skill — synthesize "
             "from it, do not paste it raw."
         ),
         backstory=full_backstory,
-        tools=[SkillRouterTool(), ScrapeWebsiteTool()],
+        tools=[SkillRouterTool(), ScrapeWebsiteTool(), EVMBalanceCheckerTool()],
         llm=create_llm(),
         verbose=True,
         allow_delegation=False,
