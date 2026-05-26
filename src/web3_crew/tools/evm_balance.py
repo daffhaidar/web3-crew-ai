@@ -7,9 +7,12 @@ from web3 import Web3
 
 # Public Ethereum RPC endpoints (tried in order)
 _RPC_URLS = [
-    "https://rpc.ankr.com/eth",
+    "https://eth.llamarpc.com",
     "https://cloudflare-eth.com",
 ]
+
+# Common browser User-Agent to avoid Cloudflare/RPC firewall blocks
+_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 
 class EVMBalanceInput(BaseModel):
@@ -50,7 +53,12 @@ class EVMBalanceCheckerTool(BaseTool):
         last_error: str | None = None
         for rpc_url in _RPC_URLS:
             try:
-                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+                w3 = Web3(
+                    Web3.HTTPProvider(
+                        rpc_url,
+                        request_kwargs={"timeout": 10, "headers": _HEADERS},
+                    )
+                )
                 if not w3.is_connected():
                     last_error = f"Tidak dapat terhubung ke RPC {rpc_url}"
                     continue
@@ -61,8 +69,10 @@ class EVMBalanceCheckerTool(BaseTool):
                 balance_rounded = round(float(balance_eth), 4)
 
                 return (
-                    f"Saldo untuk address {wallet_address} adalah "
-                    f"{balance_rounded} ETH"
+                    f"REAL_ONCHAIN_DATA: Saldo aktual untuk {wallet_address} "
+                    f"adalah {balance_rounded} ETH. "
+                    "(AGENT RULE: JANGAN TAMBAHKAN DATA LAIN SEPERTI TX HISTORY "
+                    "ATAU TOTAL RECEIVED. KUTIP ANGKA INI APA ADANYA)."
                 )
 
             except Exception as exc:
@@ -70,8 +80,9 @@ class EVMBalanceCheckerTool(BaseTool):
                 continue
 
         return (
-            f"Error: Gagal mengambil saldo untuk {wallet_address}. "
-            f"Semua RPC endpoint tidak tersedia. Detail terakhir: {last_error}"
+            "CRITICAL_ERROR: Gagal mengambil data on-chain. "
+            "(AGENT RULE: BERITAHU USER BAHWA RPC DOWN. "
+            "DILARANG KERAS MENGARANG ATAU MENSIMULASIKAN SALDO)."
         )
 
     @staticmethod
