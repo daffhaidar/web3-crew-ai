@@ -17,6 +17,7 @@ missing or renamed.
 """
 
 from __future__ import annotations
+from datetime import datetime
 
 from pathlib import Path
 
@@ -74,6 +75,9 @@ def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") 
     skills are injected directly into ``backstory`` to form its core identity.
     """
     base_persona = load_persona(persona_dir)
+    
+    current_date = f"Today's date: {datetime.now().strftime('%Y-%m-%d %A')}. Your knowledge cutoff date is December 2024.\n\n"
+    base_persona = current_date + base_persona
     
     # Masukkan dynamic skills langsung ke DNA backstory jika ada data masuk
     if skill_context:
