@@ -3,6 +3,13 @@ from typing import Type
 
 from crewai.tools import BaseTool
 from pydantic import BaseModel
+from web3 import Web3
+
+# Public Ethereum RPC endpoints (tried in order)
+_RPC_URLS = [
+    "https://rpc.ankr.com/eth",
+    "https://cloudflare-eth.com",
+]
 
 
 class EVMBalanceInput(BaseModel):
@@ -14,13 +21,13 @@ class EVMBalanceCheckerTool(BaseTool):
     """
     A tool that checks the balance of an EVM wallet address.
 
-    Validates the address format and returns a simulated balance response.
+    Connects to a public Ethereum RPC to fetch the real on-chain ETH balance.
     """
 
     name: str = "EVM Balance Checker"
     description: str = (
         "Checks the ETH balance of a given EVM wallet address. "
-        "Returns a simulated balance in ETH."
+        "Returns the live on-chain balance in ETH."
     )
     args_schema: Type[BaseModel] = EVMBalanceInput
 
@@ -40,7 +47,33 @@ class EVMBalanceCheckerTool(BaseTool):
                 "Format yang benar: 0x diikuti 40 karakter heksadesimal."
             )
 
-        return f"Saldo untuk address {wallet_address} adalah 0.0 ETH (Simulasi)"
+        last_error: str | None = None
+        for rpc_url in _RPC_URLS:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+                if not w3.is_connected():
+                    last_error = f"Tidak dapat terhubung ke RPC {rpc_url}"
+                    continue
+
+                balance_wei = w3.eth.get_balance(
+                    Web3.to_checksum_address(wallet_address)
+                )
+                balance_eth = w3.from_wei(balance_wei, "ether")
+                balance_rounded = round(float(balance_eth), 4)
+
+                return (
+                    f"Saldo untuk address {wallet_address} adalah "
+                    f"{balance_rounded} ETH"
+                )
+
+            except Exception as exc:
+                last_error = f"Gagal mengambil saldo dari {rpc_url}: {exc}"
+                continue
+
+        return (
+            f"Error: Gagal mengambil saldo untuk {wallet_address}. "
+            f"Semua RPC endpoint tidak tersedia. Detail terakhir: {last_error}"
+        )
 
     @staticmethod
     def _is_valid_evm_address(address: str) -> bool:
