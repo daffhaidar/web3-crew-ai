@@ -47,7 +47,7 @@ class SkillManager:
     # cap are *partially* loaded (the last one is truncated mid-content) so
     # the skill router never silently drops everything when a single big file
     # would otherwise blow the budget.
-    MAX_CONTEXT_CHARS: Final[int] = 16000
+    MAX_CONTEXT_CHARS: Final[int] = 25000
 
     # Always-on identity files. These short character / heartbeat documents
     # load on every invocation regardless of command — they are the bot's
@@ -98,34 +98,24 @@ class SkillManager:
         except OSError as e:
             logger.error("Failed to create skills directory: %s", e)
 
-    def process_zip(self, zip_path: Path) -> int:
-        """Process uploaded ZIP file and extract skill documents.
-
-        Args:
-            zip_path: Path to uploaded ZIP file
-
-        Returns:
-            Count of successfully extracted skill files
-
-        Raises:
-            ValueError: If ZIP contains forbidden file types
-            zipfile.BadZipFile: If ZIP is corrupted or invalid
-            OSError: If filesystem operations fail
-        """
-        logger.info("Processing ZIP file: %s", zip_path)
+    def process_zip(self, zip_path: Path, force: bool = False) -> int:
+        """Process uploaded ZIP file. If force=True, ignore forbidden files."""
+        logger.info("Processing ZIP file: %s (Force: %s)", zip_path, force)
 
         try:
             with zipfile.ZipFile(zip_path, "r") as zip_file:
-                # Validate contents before extraction
-                self._validate_zip_contents(zip_file)
+                # Bypass validasi jika force=True
+                if not force:
+                    self._validate_zip_contents(zip_file)
 
-                # Extract skill files
+                # Ekstrak file (tetap hanya mengekstrak .md dan .txt)
                 count = self._extract_skill_files(zip_file)
 
                 logger.info("Successfully extracted %d skill files", count)
                 return count
 
         except zipfile.BadZipFile as e:
+
             logger.error("Corrupted or invalid ZIP file: %s", e)
             raise
         except ValueError as e:

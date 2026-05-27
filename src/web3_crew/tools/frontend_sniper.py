@@ -74,6 +74,7 @@ async def _monitor_and_mint_async(
         print(f"[FrontendSniper] Membuka {url} …")
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
+        # Zero-Reload Sniping (DOM Mutation Observer)
         print(f"[FrontendSniper] Menanam DOM Mutation Observer di {url}...")
         await page.evaluate("""(keywords) => {
             return new Promise((resolve) => {
@@ -97,7 +98,7 @@ async def _monitor_and_mint_async(
                 observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'class', 'aria-disabled'] });
             });
         }""", _MINT_KEYWORDS)
-        
+
         print("[FrontendSniper] BINGO! Mutasi DOM terdeteksi, tombol aktif!")
         valid_buttons = []
         for keyword in _MINT_KEYWORDS:
@@ -105,7 +106,8 @@ async def _monitor_and_mint_async(
             count = await loc.count()
             for i in range(count):
                 btn = loc.nth(i)
-                if not await btn.is_disabled():
+                is_disabled = await btn.is_disabled()
+                if not is_disabled:
                     valid_buttons.append(btn)
 
         tx_hashes: list[str] = []
@@ -211,7 +213,6 @@ async def _monitor_and_mint_async(
 
         print(f"[FrontendSniper] Memulai infiltrasi dari {len(wallets)} wallet berurutan…")
         
-        # Eksekusi berurutan agar injeksi JS tiap wallet tidak saling timpa
         for w in wallets:
             result = await _click_mint_for_wallet(w)
             if result is None:

@@ -29,13 +29,12 @@ import tempfile
 from pathlib import Path
 from typing import Final
 
-from telegram import Update
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -111,9 +110,7 @@ _init_user_db()
 # Inisialisasi Skill Manager (Dynamic Ingestion)
 _skill_manager = SkillManager()
 
-# Singleton queue for scheduled mints; created lazily so tests can override
-# the queue path via ScheduledMintQueue(queue_path=...) before this is
-# accessed.
+# Singleton queue for scheduled mints
 _scheduled_queue: ScheduledMintQueue | None = None
 
 
@@ -124,20 +121,13 @@ def _get_scheduled_queue() -> ScheduledMintQueue:
     return _scheduled_queue
 
 
-# Regex untuk mendeteksi EVM address di dalam kalimat natural.
+# Regex definitions
 _ADDRESS_RE: Final[re.Pattern[str]] = re.compile(r"0x[a-fA-F0-9]{40}")
 _TX_HASH_RE: Final[re.Pattern[str]] = re.compile(r"0x[a-fA-F0-9]{64}")
-
-# Schedule directive in a natural-language mint message. Matches:
-#   ' @06:00 UTC'  ' @06:00'  ' @1715000000'  ' @+30m'  ' @+90s'  ' @+2h'
 _SCHEDULE_RE: Final[re.Pattern[str]] = re.compile(
     r"@\s*(\+?\d+[smh]?|\d{1,2}:\d{2}(?:\s*UTC)?)",
     flags=re.IGNORECASE,
 )
-
-# Keywords that indicate a balance / saldo query.  When these appear
-# together with an EVM address the request is routed to the ChatAgent
-# instead of the audit pipeline so it can call the balance tool directly.
 _BALANCE_KEYWORDS: Final[tuple[str, ...]] = (
     "saldo", "balance", "cek saldo", "check balance",
     "cek balance", "check saldo",
@@ -159,7 +149,6 @@ async def _gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.warning("Dropping update from unauthorized sender id=%s", sender_id)
         raise ApplicationHandlerStop
 
-    # Log authorized user interaction to SQLite
     _log_user_chat_id(
         chat_id=user.id,
         username=user.username or user.first_name,
@@ -171,18 +160,12 @@ async def _gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------------------------------------------------------------------------
 
 def _extract_address_from_text(text: str) -> str | None:
-    """Scan the entire text for an EVM address and return it if found."""
     match = _ADDRESS_RE.search(text)
     return match.group(0) if match else None
 
 def _format_report(payload: str) -> str:
-    """Format audit report dari JSON mentah menjadi tampilan Telegram."""
     text = payload.strip()
-    
-    # Trik variabel agar tidak merusak tampilan markdown AI
     simbol_kutip = "`" * 3
-    
-    # KUPAS BUNGKUS MARKDOWN: Hapus bungkus json di awal dan akhir
     text = re.sub(r'^' + simbol_kutip + r'(?:json)?\s*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s*' + simbol_kutip + r'$', '', text)
     
@@ -244,24 +227,14 @@ def _format_report(payload: str) -> str:
     return f"<pre>{html.escape(text)}</pre>"
 
 def _format_chat_reply(payload: str) -> str:
-    """Format plain text balasan chat dengan menerjemahkan Markdown ke HTML Telegram."""
     text = (payload or "").strip()
-
     limit = _TELEGRAM_PLAIN_MAX - 20
     if len(text) > limit:
         text = text[:limit] + "\n...(truncated)"
 
-    # 1. Escape karakter HTML bawaan biar kaga bentrok dengan Telegram parser
     text = html.escape(text)
-
-    # 2. Parse Code Blocks (Triple Backticks) DULUAN
-    # Menangkap ```javascript\nkode\n``` atau ```kode``` dan mengubahnya jadi <pre>
     text = re.sub(r'```[a-zA-Z0-9]*\n?(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
-
-    # 3. Parse Inline Code (Single Backtick)
     text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-
-    # 4. Parse Bold
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
 
     return text
@@ -283,12 +256,10 @@ async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Coba eksekusi Crew
                 result = await asyncio.to_thread(crew.kickoff)
-                break  # Kalau sukses, keluar dari loop
+                break 
             except Exception as e:
                 error_msg = str(e)
-                # Deteksi error 503 atau Service Unavailable
                 if "503" in error_msg or "ServiceUnavailable" in error_msg:
                     if attempt < max_retries - 1:
                         await update.message.reply_text(
@@ -296,7 +267,6 @@ async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE
                         )
                         await asyncio.sleep(5)
                         continue
-                # Kalau bukan 503 atau jatah retry abis, lempar errornya
                 raise e
     finally:
         heartbeat.cancel()
@@ -309,11 +279,10 @@ async def _run_with_heartbeat(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------------------------------------------------------------------
-# Command & Message Handlers
+# Command Handlers
 # ---------------------------------------------------------------------------
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Greet the authorized user and report bot status."""
     user = update.effective_user
     name = html.escape(user.first_name) if user and user.first_name else "boss"
     msg = (
@@ -338,7 +307,6 @@ async def handle_skill_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     try:
         file = await context.bot.get_file(document.file_id)
-        # Jangan gunakan context manager 'with' agar file tidak otomatis terhapus saat error
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
         tmp_path = Path(tmp.name)
         tmp.close()
@@ -351,7 +319,6 @@ async def handle_skill_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             tmp_path.unlink(missing_ok=True)
             
         except ValueError:
-            # File berbahaya terdeteksi. Munculkan tombol Bypass.
             context.user_data['pending_zip'] = str(tmp_path)
             
             keyboard = [
@@ -392,7 +359,6 @@ async def handle_zip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.data == "bypass_zip_yes":
         await query.edit_message_text("[*] Memaksa eksekusi file...")
         try:
-            # Panggil dengan force=True
             count = _skill_manager.process_zip(tmp_path, force=True)
             await query.edit_message_text(f"Yaudah oke gue eksekusi yaa.. DYOR oke. Total {count} file diserap.")
         except Exception as e:
@@ -400,12 +366,10 @@ async def handle_zip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await query.edit_message_text("[-] Eksekusi dibatalkan demi keamanan.")
         
-    # Cleanup
     tmp_path.unlink(missing_ok=True)
     context.user_data.pop('pending_zip', None)
     
 async def handle_mint_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Menangani klik tombol konfirmasi MINT."""
     query = update.callback_query
     await query.answer()
     
@@ -418,11 +382,10 @@ async def handle_mint_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         
     if query.data == "confirm_mint_yes":
         await query.edit_message_text(
-            f"?? <b>Mengeksekusi transaksi on-chain untuk</b> <code>{html.escape(address)}</code>...", 
+            f"? <b>Mengeksekusi transaksi on-chain untuk</b> <code>{html.escape(address)}</code>...", 
             parse_mode=ParseMode.HTML
         )
         try:
-            # Eksekusi Penuh (Bypass Audit karena udah diaudit sebelumnya)
             crew = build_crew(
                 token_address=address, 
                 action="mint", 
@@ -447,15 +410,12 @@ async def handle_mint_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await query.edit_message_text(f"[!] Eksekusi <b>dibatalkan</b> oleh operator. Dana aman.", parse_mode=ParseMode.HTML)
         
-    # Bersihkan memori sesi
     context.user_data.pop('pending_mint_address', None)
     context.user_data.pop('pending_mint_skill', None)
-
 
 async def _handle_phase_probe(
     update: Update, address: str, user_input: str
 ) -> None:
-    """Read-only mint phase + eligibility probe. No tx, no wallet use."""
     try:
         w3 = Web3(Web3.HTTPProvider(settings.web3_rpc_url))
         user_addr_match = re.search(
@@ -482,13 +442,14 @@ async def _handle_phase_probe(
         await update.message.reply_text("Phase probe gagal. Cek log server.")
 
 
+# PERHATIAN: _handle_schedule_mint tetap dipertahankan sebagai fallback/legacy.
+# SUPERAGENT akan menangani penjadwalan via chat_agents.py jika terdeteksi.
 async def _handle_schedule_mint(
     update: Update,
     address: str,
     user_input: str,
     schedule_spec: str,
 ) -> None:
-    """Parse 'mint N di 0x... @06:00 UTC' and enqueue."""
     target_ts = parse_schedule_time(schedule_spec)
     if target_ts is None:
         await update.message.reply_text(
@@ -497,7 +458,6 @@ async def _handle_schedule_mint(
         )
         return
 
-    # qty: look for "N kali", "N nft", "N qty" or first standalone integer 1-50
     qty = 1
     m = re.search(r"\b(\d{1,2})\s*(?:x|qty|kali|nft|piece|pcs)?\b", user_input.lower())
     if m:
@@ -505,13 +465,11 @@ async def _handle_schedule_mint(
         if 1 <= candidate <= 50:
             qty = candidate
 
-    # function_name: default publicMint. Allow override via "via mint(uint256)" etc.
     fn_name = "publicMint"
     fn_match = re.search(r"\bvia\s+(\w+)\b", user_input.lower())
     if fn_match:
         fn_name = fn_match.group(1)
 
-    # value_eth: look for "@0.0003 ETH" pattern (NOT the schedule @) or "value 0.001"
     value_wei = 0
     val_match = re.search(
         r"(?:value|harga|price)[\s:=]*(\d*\.?\d+)\s*eth",
@@ -545,14 +503,13 @@ async def _handle_schedule_mint(
 
 
 async def scheduled_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all scheduled mint jobs."""
     queue = _get_scheduled_queue()
     jobs = await queue.list_all()
     if not jobs:
         await update.message.reply_text("No scheduled mint jobs.")
         return
     active = [j for j in jobs if not j.is_terminal]
-    terminal = [j for j in jobs if j.is_terminal][-5:]  # last 5
+    terminal = [j for j in jobs if j.is_terminal][-5:] 
     lines: list[str] = []
     if active:
         lines.append("<b>Active</b>")
@@ -564,7 +521,6 @@ async def scheduled_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancel a scheduled job by id prefix: /cancel <id8>"""
     if not context.args:
         await update.message.reply_text("Usage: /cancel <job_id_prefix>")
         return
@@ -586,7 +542,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _scheduled_notifier(job: ScheduledJob, emoji: str, msg: str) -> None:
-    """Send DM to the authorized user when a scheduled job completes."""
     try:
         from telegram import Bot
 
@@ -608,10 +563,6 @@ async def _scheduled_notifier(job: ScheduledJob, emoji: str, msg: str) -> None:
 
 
 async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Intelligent router yang menggantikan slash commands.
-    Membaca input natural dari user dan memicu pipeline yang tepat.
-    """
     user_input = update.message.text.strip()
     user_id = update.effective_user.id
 
@@ -621,19 +572,10 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
         user_id
     )
 
-    # -------------------------------------------------------------
-    # CONTEXT INJECTION
-    # Per-command skill routing: identity files always load, and only the
-    # m-skills relevant to the chosen pipeline get pulled in. See
-    # SkillManager.COMMAND_SKILL_MAP for the prefix-to-command mapping.
-    # -------------------------------------------------------------
     augmented_input_lower = user_input.lower()
     address = _extract_address_from_text(user_input)
 
     # 0. ROUTING: BALANCE / SALDO CHECK
-    #    If the user mentions a wallet address together with balance-related
-    #    keywords (saldo, balance, cek saldo, ...), skip audit/mint entirely
-    #    and let the ChatAgent (SUPERAGENT) handle it with the balance tool.
     if address and any(kw in augmented_input_lower for kw in _BALANCE_KEYWORDS):
         skill_context = _skill_manager.get_skill_context(command="chat")
         await update.message.reply_text(
@@ -652,7 +594,7 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("Gagal cek saldo. Cek log server.")
         return
 
-    # 0b. ROUTING: PHASE PROBE (read-only, no tx)
+    # 0b. ROUTING: PHASE PROBE
     _PHASE_KEYWORDS = (
         "phase", "fase", "eligible", "eligibility",
         "kapan buka", "kapan mulai", "info mint",
@@ -661,49 +603,60 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
         await _handle_phase_probe(update, address, user_input)
         return
 
-    # 1a. ROUTING: SCHEDULED MINT (mint + address + @<time>)
-    schedule_match = _SCHEDULE_RE.search(user_input)
-    if (
-        address
-        and schedule_match
-        and any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "buy"])
-    ):
-        await _handle_schedule_mint(update, address, user_input, schedule_match.group(1))
-        return
+    # --- PERBAIKAN FATAL: DETEKSI NIAT (INTENT DETECTION) ---
+    is_mint_intent = any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "gas", "buy"])
+    _TIME_KEYWORDS = ("jam", "menit", "nanti", "standby", "antri", "jadwal", "besok", "@")
+    has_time_intent = any(kw in augmented_input_lower for kw in _TIME_KEYWORDS)
 
-    # 1. ROUTING: MINT PIPELINE
-    if address and any(keyword in augmented_input_lower for keyword in ["mint", "hajar", "gas", "buy"]):
-        skill_context = _skill_manager.get_skill_context(command="mint")
-        msg = await update.message.reply_text(
-            f"[*] Mempersiapkan MINT pipeline untuk <code>{html.escape(address)}</code>...\nMelakukan audit pra-eksekusi...",
+    # 1a. ROUTING: SCHEDULED MINT (Dilemparkan ke AI SUPERAGENT biar natural)
+    if address and is_mint_intent and has_time_intent:
+        skill_context = _skill_manager.get_skill_context(command="chat")
+        await update.message.reply_text(
+            f"[*] Mendeteksi instruksi jadwal. Membiarkan SUPERAGENT memproses antrean untuk <code>{html.escape(address)}</code>...",
             parse_mode=ParseMode.HTML,
         )
         try:
-            # Jalankan Audit Dulu
+            # Panggil Chat Crew, karena SUPERAGENT punya schedule_mint_tool di sana
+            crew = build_chat_crew(augmented_input, skill_context=skill_context)
+            result = await _run_with_heartbeat(update, context, crew=crew)
+            bot_reply = _format_chat_reply(result)
+            await update.message.reply_text(bot_reply, parse_mode=ParseMode.HTML)
+
+            ContextManager.store_exchange(context.user_data, user_input, bot_reply, user_id)
+        except Exception:
+            logger.exception("Scheduled Mint via AI failed for %s", address)
+            await update.message.reply_text("[-] Gagal memproses instruksi jadwal. Cek log server.")
+        return
+
+    # 1b. ROUTING: MINT PIPELINE (EKSEKUSI INSTAN SAAT INI JUGA)
+    if address and is_mint_intent and not has_time_intent:
+        skill_context = _skill_manager.get_skill_context(command="mint")
+        msg = await update.message.reply_text(
+            f"[*] Mempersiapkan eksekusi MINT INSTAN untuk <code>{html.escape(address)}</code>...\nMelakukan audit pra-eksekusi...",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
             crew = build_crew(token_address=address, audit_only=True, skill_context=skill_context)
             audit_result = await _run_with_heartbeat(update, context, crew=crew)
             audit_report = _format_report(audit_result)
             
-            # Simpan state untuk eksekusi
             context.user_data['pending_mint_address'] = address
             context.user_data['pending_mint_skill'] = skill_context
             
-            # Buat Tombol Rem Darurat
             keyboard = [
                 [
-                    InlineKeyboardButton("[!] TANDA TANGANI & GAS", callback_data="confirm_mint_yes"),
+                    InlineKeyboardButton("[!] TANDA TANGANI & GAS SEKARANG", callback_data="confirm_mint_yes"),
                     InlineKeyboardButton("[X] BATALKAN", callback_data="confirm_mint_no")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await msg.edit_text(
-                f"{audit_report}\n\n[!] <b>OTORISASI EKSEKUSI</b>\nApakah lu yakin mau mengeksekusi transaksi untuk kontrak ini?",
+                f"{audit_report}\n\n[!] <b>OTORISASI EKSEKUSI INSTAN</b>\nApakah lu yakin mau mengeksekusi transaksi SEKARANG JUGA?",
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.HTML
             )
             
-            # Simpan log interaksi
             ContextManager.store_exchange(context.user_data, user_input, audit_report, user_id)
         except Exception:
             logger.exception("Mint pipeline audit failed for %s", address)
@@ -729,7 +682,7 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("Audit pipeline gagal. Cek log server.")
         return
 
-    # 3. ROUTING: SUPERAGENT CHAT
+    # 3. ROUTING: SUPERAGENT CHAT (Fallback)
     skill_context = _skill_manager.get_skill_context(command="chat")
     await update.message.reply_text("SUPERAGENT processing... (10-30s)")
     try:
@@ -745,6 +698,25 @@ async def natural_language_router(update: Update, context: ContextTypes.DEFAULT_
 
 
 # ---------------------------------------------------------------------------
+# Boot & Background Tasks (Post-Init Hook)
+# ---------------------------------------------------------------------------
+
+async def _post_init_hook(app: Application) -> None:
+    """This runs right after the bot connects to Telegram but before polling starts."""
+    logger.info("Initializing background scheduled mint poller...")
+    queue = _get_scheduled_queue()
+    
+    # Run the poller in the background as an asyncio task
+    # This prevents the poller from blocking the Telegram bot's main loop
+    app.create_task(
+        poll_loop(
+            queue=queue,
+            poll_interval_seconds=10.0,
+            notifier=_scheduled_notifier,
+        )
+    )
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -754,19 +726,20 @@ def build_application() -> Application:
     if settings.authorized_user_id == 0:
         raise SystemExit("AUTHORIZED_USER_ID is not set.")
 
-    app = Application.builder().token(settings.telegram_bot_token).build()
+    # Tambahkan post_init hook untuk mengeksekusi poll_loop
+    app = Application.builder().token(settings.telegram_bot_token).post_init(_post_init_hook).build()
 
-    # OPSEC Gatekeeper
     app.add_handler(TypeHandler(Update, _gatekeeper), group=-1)
 
+    # Daftarin semua slash commands
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("scheduled", scheduled_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Handler ZIP Upload & Tombolnya (TARUH DI SINI)
     app.add_handler(MessageHandler(filters.Document.ZIP, handle_skill_upload))
     app.add_handler(CallbackQueryHandler(handle_zip_callback, pattern="^bypass_zip_"))
     app.add_handler(CallbackQueryHandler(handle_mint_callback, pattern="^confirm_mint_"))
 
-    # Router NLP harus di bawah supaya kaga nabrak command lain
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_router))
 
     return app
