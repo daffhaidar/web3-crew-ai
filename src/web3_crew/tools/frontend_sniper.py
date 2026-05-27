@@ -10,6 +10,7 @@ import os
 import time
 import asyncio
 from datetime import datetime, timezone
+from typing import Optional
 
 from crewai.tools import tool
 from playwright.async_api import async_playwright
@@ -52,8 +53,8 @@ def _seconds_until(target_ts: float) -> float:
 
 async def _monitor_and_mint_async(
     url: str,
-    target_time_spec: str | None,
-    wallet_count: int,
+    target_time_spec: Optional[str] = None,
+    wallet_count: int = 4,
 ) -> str:
     # --- resolve wallets ---
     wallets = _load_wallets(wallet_count)
@@ -240,17 +241,21 @@ async def _monitor_and_mint_async(
 @tool("Playwright Frontend Sniper")
 def playwright_frontend_sniper(
     url: str,
-    target_time_spec: str | None = None,
+    target_time_spec: Optional[str] = None,
     wallet_count: int = 4,
 ) -> str:
     """
     Monitor a mint page using a headless browser and auto-mint when the button activates.
+
     Supports standby countdown and multi-wallet parallel execution.
 
     Args:
         url: The mint page URL to monitor.
-        target_time_spec: (Optional) When to start monitoring. Relative offset like '+10m', '+1h', or absolute UTC time like '13:00 UTC'. If omitted, monitoring starts immediately.
-        wallet_count: Number of wallets to use (reads PRIV_KEY_1…N from env). Default 4.
+        target_time_spec: When to start monitoring. Relative offset like
+            '+10m', '+1h', or absolute UTC time like '13:00 UTC'.
+            If omitted, monitoring starts immediately.
+        wallet_count: Number of wallets to use (reads PRIV_KEY_1…N from env).
+            Default 4.
     """
     loop = asyncio.new_event_loop()
     try:
