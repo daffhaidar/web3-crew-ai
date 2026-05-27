@@ -21,6 +21,7 @@ from web3_crew.tools.mint_phase import probe_mint_phase
 from web3_crew.tools.safe_transaction import SafeTransactionTool
 from web3_crew.tools.scheduled_mint import ScheduledMintQueue, parse_schedule_time
 from web3_crew.tools.frontend_sniper import playwright_frontend_sniper
+from web3_crew.tools.sybil_manager import manage_sybil_wallets
 
 _FALLBACK_PERSONA = (
     "You are SUPERAGENT — an elite, laid-back Web3 engineer. Direct, tactical, "
@@ -149,6 +150,7 @@ def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") 
             execute_mint_tool,
             schedule_mint_tool,
             playwright_frontend_sniper,
+            manage_sybil_wallets,
         ], 
         llm=create_llm(),
         verbose=True,
