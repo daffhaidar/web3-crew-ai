@@ -1,39 +1,26 @@
 """ChatAgent — general-purpose assistant with the SUPERAGENT persona.
 
-This agent is the entry point for ``/chat <text>`` Telegram commands. It:
-
-1. Loads the SUPERAGENT persona (``SOUL.md`` + ``IDENTITY.md``) as its
-   ``backstory`` so its tone, traits, and hard stops are baked into every
-   reply.
-2. Uses :class:`web3_crew.tools.skill_router.SkillRouterTool` to dynamically
-   pull the relevant ``SKILL.md`` body for the user's request, then synthesizes
-   an answer in SUPERAGENT style.
-3. Uses ScrapeWebsiteTool to extract content from URLs provided by users.
-
-The persona is loaded from ``.agents/persona/*.md`` at agent-creation time.
-Failure to find a persona file is non-fatal — we fall back to a minimal
-in-code persona so the bot keeps working even if the persona files are
-missing or renamed.
+This agent is the entry point for /chat Telegram commands.
 """
 
 from __future__ import annotations
-from datetime import datetime
 
 import os
+import json
+import asyncio
 from pathlib import Path
 
 from crewai import Agent
-from crewai.tools import tool
 from crewai_tools import ScrapeWebsiteTool
+from crewai.tools import tool
 from web3 import Web3
 
 from web3_crew.llm import create_llm
-from web3_crew.tools.evm_balance import EVMBalanceCheckerTool
-from web3_crew.tools.mint_phase import probe_mint_phase
 from web3_crew.tools.skill_router import SkillRouterTool
+from web3_crew.tools.mint_phase import probe_mint_phase
+from web3_crew.tools.safe_transaction import SafeTransactionTool
+from web3_crew.tools.scheduled_mint import ScheduledMintQueue, parse_schedule_time
 
-# Fallback persona used if .agents/persona/*.md is missing. Kept short to
-# avoid drifting from the canonical SUPERAGENT spec.
 _FALLBACK_PERSONA = (
     "You are SUPERAGENT — an elite, laid-back Web3 engineer. Direct, tactical, "
     "adaptive. Auto-detect language; strictly use casual 'lo/gue' for Indonesian users. "
@@ -42,49 +29,74 @@ _FALLBACK_PERSONA = (
     "No moralizing, no disclaimers — except for extreme hard stops (minors/WMD)."
 )
 
+# --- TOOLS ---
 
-# ---------------------------------------------------------------------------
-# Web3 helper for tools that need on-chain access
-# ---------------------------------------------------------------------------
-
-_w3_instance: Web3 | None = None
-
-
-def _get_web3() -> Web3:
-    """Return a shared Web3 instance, lazy-initialised from ``ETH_RPC_URL``."""
-    global _w3_instance
-    if _w3_instance is None:
-        rpc_url = os.environ.get("ETH_RPC_URL", "https://eth.llamarpc.com")
-        _w3_instance = Web3(Web3.HTTPProvider(rpc_url))
-    return _w3_instance
-
-
-# ---------------------------------------------------------------------------
-# CrewAI @tool wrappers
-# ---------------------------------------------------------------------------
-
-
-@tool("mint_phase_probe")
-def mint_phase_probe(contract_address: str, user_address: str = "") -> str:
-    """Probe the minting status of an NFT contract (is it open, price, supply, etc) without executing transactions.
-
-    Args:
-        contract_address: The NFT contract address to probe (checksummed or lowercased).
-        user_address: Optional wallet address to check per-wallet minted counts.
+@tool("NFT Mint Phase Probe")
+def probe_mint_phase_tool(contract_address: str, user_address: str | None = None) -> str:
     """
-    w3 = _get_web3()
-    user_addr = user_address.strip() or None
-    result = probe_mint_phase(w3, contract_address, user_address=user_addr)
+    Probe the minting status of an NFT contract (is it open, price, supply, etc) without executing transactions.
+    Use this tool before any minting interaction.
+    """
+    rpc_url = os.getenv("RPC_URL", "https://eth.llamarpc.com")
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    
+    result = probe_mint_phase(w3, contract_address, user_address=user_address)
     return result.summary()
 
+@tool("NFT Mint Executor")
+def execute_mint_tool(contract_address: str, function_name: str, qty: int, value_wei: int = 0) -> str:
+    """
+    Execute an immediate mint transaction on a smart contract.
+    Only use this if the user wants to mint RIGHT NOW.
+    """
+    tool_instance = SafeTransactionTool()
+    payload = {
+        "action": "mint",
+        "contract_address": contract_address,
+        "function_name": function_name,
+        "function_args": [qty] if function_name != "publicMint" else [],
+        "value_wei": value_wei,
+        "risk_score": 0
+    }
+    return tool_instance._run(json.dumps(payload))
 
-# ---------------------------------------------------------------------------
-# Persona loading
-# ---------------------------------------------------------------------------
+@tool("Schedule NFT Mint")
+def schedule_mint_tool(contract_address: str, qty: int, schedule_time_spec: str, function_name: str = "publicMint", value_wei: int = 0) -> str:
+    """
+    Schedule an NFT mint job for the future (Autopilot / Standby mode).
+    Args:
+        contract_address: The target NFT contract.
+        qty: Number of NFTs to mint.
+        schedule_time_spec: Time specification format. High priority: relative offset like '+10m', '+1h', or absolute UTC time like '13:00 UTC'.
+        function_name: Name of the mint function (e.g., 'publicMint', 'mint').
+        value_wei: Total cost in WEI.
+    """
+    target_timestamp = parse_schedule_time(schedule_time_spec)
+    if target_timestamp is None:
+        return "❌ Gagal parse waktu. Gunakan format '+15m', '+2h', atau 'HH:MM UTC'."
 
+    async def _async_enqueue():
+        queue = ScheduledMintQueue()
+        return await queue.enqueue(
+            contract_address=contract_address,
+            qty=qty,
+            scheduled_at=target_timestamp,
+            value_wei=value_wei,
+            function_name=function_name
+        )
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        job = loop.run_until_complete(_async_enqueue())
+        loop.close()
+        return f"✅ Autopilot Active! Job ID: {job.id[:8]} scheduled successfully at Unix {job.scheduled_at}."
+    except Exception as e:
+        return f"❌ Failed to queue the scheduled job: {str(e)}"
+
+# --- HELPER FUNCTIONS ---
 
 def _default_persona_dir() -> Path:
-    """Resolve ``.agents/persona/`` by walking up from this module's path."""
     here = Path(__file__).resolve()
     for parent in (here, *here.parents):
         candidate = parent / ".agents" / "persona"
@@ -94,12 +106,6 @@ def _default_persona_dir() -> Path:
 
 
 def load_persona(persona_dir: Path | None = None) -> str:
-    """Load and concatenate the persona files into a single backstory string.
-
-    Reads ``SOUL.md`` then ``IDENTITY.md`` from ``persona_dir``. Missing files
-    are skipped silently. Returns the fallback persona if nothing loadable is
-    found.
-    """
     persona_dir = persona_dir or _default_persona_dir()
     parts: list[str] = []
     for fname in ("SOUL.md", "IDENTITY.md"):
@@ -111,28 +117,19 @@ def load_persona(persona_dir: Path | None = None) -> str:
     return "\n\n".join(parts)
 
 
-def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") -> Agent:
-    """Build the SUPERAGENT-persona ChatAgent with dynamic context support.
+# --- AGENT FACTORY ---
 
-    The agent has two tools: skill_router for domain-specific knowledge and
-    scrape_website for extracting content from URLs. The persona and dynamic 
-    skills are injected directly into ``backstory`` to form its core identity.
-    """
-    base_persona = load_persona(persona_dir)
+def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") -> Agent:
+    """Build the SUPERAGENT-persona ChatAgent with deep context injection."""
+    persona = load_persona(persona_dir)
     
-    current_date = f"Today's date: {datetime.now().strftime('%Y-%m-%d %A')}. Your knowledge cutoff date is December 2024.\n\n"
-    base_persona = current_date + base_persona
-    
-    # Masukkan dynamic skills langsung ke DNA backstory jika ada data masuk
     if skill_context:
-        full_backstory = (
-            f"{base_persona}\n\n"
-            f"=== CRITICAL CURRENT CORE PERSONA EXTENSION (DYNAMIC SKILLS) ===\n"
+        persona = (
+            f"{persona}\n\n"
+            f"=== CORE IDENTITY OVERRIDE & DYNAMIC SKILLS ===\n"
             f"{skill_context}\n"
-            f"================================================================"
+            f"==============================================="
         )
-    else:
-        full_backstory = base_persona
 
     return Agent(
         role="SUPERAGENT — General Execution Agent",
@@ -140,24 +137,17 @@ def create_chat_agent(persona_dir: Path | None = None, skill_context: str = "") 
             "Answer the user's request directly and immediately, in their "
             "language, with concrete executable steps. Use the skill_router "
             "tool to pull domain-specific knowledge when the request touches a "
-            "specialized area (server, monetize, content, automation, data, "
-            "API, AI, files, frontend, audit, strategy, debug). Use the "
-            "scrape_website tool to extract content from any URLs provided by "
-            "the user. Use the EVMBalanceCheckerTool to validate and check the "
-            "simulated balance of any EVM wallet address provided by the user. "
-            "Use the mint_phase_probe tool to check whether an NFT contract's "
-            "minting is open, its price, supply, and per-wallet caps. "
-            "For Web3 questions about THIS bot itself, the "
-            "skill_router will surface the matching repo skill — synthesize "
-            "from it, do not paste it raw."
+            "specialized area. Use the scrape_website tool to extract content "
+            "from any URLs provided by the user."
         ),
-        backstory=full_backstory,
+        backstory=persona,
         tools=[
-            SkillRouterTool(),
-            ScrapeWebsiteTool(),
-            EVMBalanceCheckerTool(),
-            mint_phase_probe,
-        ],
+            SkillRouterTool(), 
+            ScrapeWebsiteTool(), 
+            probe_mint_phase_tool, 
+            execute_mint_tool,
+            schedule_mint_tool
+        ], 
         llm=create_llm(),
         verbose=True,
         allow_delegation=False,
