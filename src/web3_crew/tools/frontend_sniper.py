@@ -74,34 +74,39 @@ async def _monitor_and_mint_async(
         print(f"[FrontendSniper] Membuka {url} …")
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
+        print(f"[FrontendSniper] Menanam DOM Mutation Observer di {url}...")
+        await page.evaluate("""(keywords) => {
+            return new Promise((resolve) => {
+                const checkButtons = () => {
+                    const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+                    for (const btn of btns) {
+                        const text = (btn.innerText || '').toLowerCase();
+                        const match = keywords.some(k => text.includes(k));
+                        const isDisabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true' || btn.classList.contains('disabled');
+                        if (match && !isDisabled) return true;
+                    }
+                    return false;
+                };
+                if (checkButtons()) return resolve(true);
+                const observer = new MutationObserver(() => {
+                    if (checkButtons()) {
+                        observer.disconnect();
+                        resolve(true);
+                    }
+                });
+                observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'class', 'aria-disabled'] });
+            });
+        }""", _MINT_KEYWORDS)
+        
+        print("[FrontendSniper] BINGO! Mutasi DOM terdeteksi, tombol aktif!")
         valid_buttons = []
-        attempt = 0
-
-        while True:
-            attempt += 1
-            try:
-                await page.reload(wait_until="domcontentloaded", timeout=15_000)
-            except Exception:
-                await asyncio.sleep(1)
-                continue
-
-            for keyword in _MINT_KEYWORDS:
-                locator = page.get_by_role("button", name=re.compile(keyword, re.IGNORECASE))
-                count = await locator.count()
-                for i in range(count):
-                    candidate = locator.nth(i)
-                    is_disabled = await candidate.is_disabled()
-                    if not is_disabled:
-                        valid_buttons.append(candidate)
-
-            if valid_buttons:
-                print(f"[FrontendSniper] BINGO! Ketemu {len(valid_buttons)} tombol potensial. Siap di-test satu per satu.")
-                break
-
-            if attempt % 15 == 0:
-                print(f"[FrontendSniper] Masih nyari boss… attempt #{attempt}")
-
-            await asyncio.sleep(1.5)
+        for keyword in _MINT_KEYWORDS:
+            loc = page.get_by_role("button", name=re.compile(keyword, re.IGNORECASE))
+            count = await loc.count()
+            for i in range(count):
+                btn = loc.nth(i)
+                if not await btn.is_disabled():
+                    valid_buttons.append(btn)
 
         tx_hashes: list[str] = []
         failed_count = 0
