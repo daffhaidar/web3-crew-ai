@@ -151,41 +151,100 @@ async def _monitor_and_mint_async(
         print(f"[FrontendSniper] Konteks sekitar tombol:\n{parent_text[:300]}")
 
         # --- broadcast mint txs via multi-wallet ---
-        # NOTE: Di lingkungan nyata, calldata harus di-generate dari ABI kontrak.
-        # Di sini kita click tombol via browser sebagai trigger dan juga
-        # broadcast dummy tx pattern yang bisa di-override oleh caller.
-        # Untuk safety, kita klik tombol via Playwright per wallet.
+        # Inject mock window.ethereum provider to intercept dApp wallet calls
+        # and capture raw transaction payloads directly from the frontend.
 
         tx_hashes: list[str] = []
         failed_count = 0
+        _capture_exposed = False
 
-        async def _click_mint_for_wallet(w: dict) -> str | None:
-            """Click mint button and capture any resulting tx hash from page."""
+        async def _click_mint_for_wallet(w: dict) -> dict | None:
+            """Inject mock ethereum provider, click mint, capture tx payload."""
+            nonlocal _capture_exposed
+
+            captured: list[dict] = []
+
+            # expose Python callback so JS can send captured tx data
+            async def _capture_tx(payload: dict) -> None:
+                print(
+                    f"[FrontendSniper] 🎯 TX ditangkap dari wallet "
+                    f"{w['address'][:10]}…: {payload}"
+                )
+                captured.append(payload)
+
+            # clean up previous expose if needed (multi-wallet iteration)
+            if _capture_exposed:
+                try:
+                    page.remove_listener("captureTx", lambda _: None)
+                except Exception:
+                    pass
+                _capture_exposed = False
+
+            await page.expose_function("captureTx", _capture_tx)
+            _capture_exposed = True
+
+            # inject mock window.ethereum provider
+            address = w["address"]
+            await page.add_init_script(f"""
+                window.ethereum = {{
+                    isMetaMask: true,
+                    request: async function({{ method, params }}) {{
+                        if (method === 'eth_requestAccounts' || method === 'eth_accounts') {{
+                            return ['{address}'];
+                        }}
+                        if (method === 'eth_chainId') {{
+                            return '0x1';
+                        }}
+                        if (method === 'eth_sendTransaction') {{
+                            var txData = params[0];
+                            window.captureTx(JSON.stringify(txData));
+                            // return a dummy tx hash so the dApp doesn't hang
+                            return '0x' + '0'.repeat(64);
+                        }}
+                        return null;
+                    }}
+                }};
+            """)
+            # also run on current page (add_init_script only applies on next nav)
+            await page.evaluate(f"""
+                (() => {{
+                    window.ethereum = {{
+                        isMetaMask: true,
+                        request: async function({{ method, params }}) {{
+                            if (method === 'eth_requestAccounts' || method === 'eth_accounts') {{
+                                return ['{address}'];
+                            }}
+                            if (method === 'eth_chainId') {{
+                                return '0x1';
+                            }}
+                            if (method === 'eth_sendTransaction') {{
+                                var txData = params[0];
+                                window.captureTx(JSON.stringify(txData));
+                                return '0x' + '0'.repeat(64);
+                            }}
+                            return null;
+                        }}
+                    }};
+                }})()
+            """)
+
+            print(
+                f"[FrontendSniper] Mock window.ethereum injected untuk "
+                f"wallet {w['index']} ({address[:10]}…)"
+            )
+
             try:
-                # intercept network request yang keluar dari click
-                captured_hash: str | None = None
-
-                async def _on_request(request):
-                    nonlocal captured_hash
-                    # cari request ke RPC yang mengandung eth_sendRawTransaction
-                    if "sendRawTransaction" in request.url or "eth_send" in request.url:
-                        captured_hash = request.url
-
-                async def _on_response(response):
-                    nonlocal captured_hash
-                    try:
-                        body = await response.json()
-                        if isinstance(body, dict) and "result" in body:
-                            captured_hash = body["result"]
-                    except Exception:
-                        pass
-
-                page.on("response", _on_response)
                 await mint_button.click()
-                await asyncio.sleep(2)
-                page.remove_listener("response", _on_response)
+                # give dApp time to call eth_sendTransaction via the provider
+                await asyncio.sleep(3)
 
-                return captured_hash
+                if captured:
+                    return {
+                        "wallet_index": w["index"],
+                        "wallet_address": address,
+                        "tx_payload": captured[0],
+                    }
+                return None
             except Exception as e:
                 print(f"[FrontendSniper] Wallet {w['index']} gagal click: {e}")
                 return None
@@ -209,19 +268,21 @@ async def _monitor_and_mint_async(
             elif result is None:
                 failed_count += 1
             else:
-                tx_hashes.append(str(result))
+                tx_hashes.append(
+                    f"wallet#{result['wallet_index']}: {result['tx_payload']}"
+                )
 
         await browser.close()
 
     # --- build output ---
     if failed_count == 0 and tx_hashes:
-        hashes_str = ", ".join(tx_hashes)
+        hashes_str = " | ".join(tx_hashes)
         return (
             f"✅ Sukses boss!! {len(wallets)} wallet berhasil minting NFT. "
-            f"Berikut tx hash nya: [{hashes_str}]"
+            f"Berikut tx payload nya: [{hashes_str}]"
         )
     elif tx_hashes:
-        hashes_str = ", ".join(tx_hashes)
+        hashes_str = " | ".join(tx_hashes)
         return (
             f"❌ Gagal boss!! Ada wallet yang gagal minting ({failed_count}/{len(wallets)}), "
             f"kemungkinan karena revert/gas war. "
