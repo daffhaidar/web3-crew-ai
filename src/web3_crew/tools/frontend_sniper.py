@@ -1,15 +1,10 @@
-"""PlaywrightFrontendSniperTool — browser-based mint sniper with multi-wallet broadcast.
-
-Uses Playwright headless Chromium to monitor a mint page, detect when the mint
-button activates, and then blast transactions from up to 4 wallets in parallel.
-"""
-
 from __future__ import annotations
 
 import os
 import re
 import time
 import asyncio
+import json
 from datetime import datetime, timezone
 
 from crewai.tools import tool
@@ -19,16 +14,13 @@ from eth_account import Account
 
 from web3_crew.tools.scheduled_mint import parse_schedule_time
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _MINT_KEYWORDS = ("mint", "claim", "public mint", "free")
 
-
 def _load_wallets(count: int = 4) -> list[dict]:
-    """Load wallet configs from environment variables PRIV_KEY_1 … PRIV_KEY_N."""
     wallets: list[dict] = []
     for i in range(1, count + 1):
         pk = os.getenv(f"PRIV_KEY_{i}")
@@ -42,10 +34,8 @@ def _load_wallets(count: int = 4) -> list[dict]:
         })
     return wallets
 
-
 def _seconds_until(target_ts: float) -> float:
     return target_ts - time.time()
-
 
 # ---------------------------------------------------------------------------
 # Core monitoring + minting logic
@@ -56,7 +46,6 @@ async def _monitor_and_mint_async(
     target_time_spec: str = "",
     wallet_count: int = 4,
 ) -> str:
-    # --- resolve wallets ---
     wallets = _load_wallets(wallet_count)
     if not wallets:
         return "❌ Gagal boss!! Nggak ada private key yang ketemu di env (PRIV_KEY_1..N)."
@@ -64,28 +53,20 @@ async def _monitor_and_mint_async(
     rpc_url = os.getenv("RPC_URL", "https://eth.llamarpc.com")
     w3 = Web3(Web3.HTTPProvider(rpc_url))
 
-    # --- resolve target time (optional) ---
     target_ts: float | None = None
     if target_time_spec:
         target_ts = parse_schedule_time(target_time_spec)
         if target_ts is None:
             return "❌ Gagal parse waktu. Gunakan format '+15m', '+2h', atau 'HH:MM UTC'."
 
-    # --- standby countdown ---
     if target_ts is not None:
         while _seconds_until(target_ts) > 0:
             remaining = _seconds_until(target_ts)
             mins, secs = divmod(int(remaining), 60)
-            print(
-                f"[FrontendSniper] Belum jamnya boss, standby... "
-                f"sisa {mins}m {secs}s"
-            )
-            # tidur 30 detik, tapi jangan kelewatan target
+            print(f"[FrontendSniper] Belum jamnya boss, standby... sisa {mins}m {secs}s")
             await asyncio.sleep(min(30, remaining))
-
         print("[FrontendSniper] Waktu tiba! Mulai monitoring aktif…")
 
-    # --- launch browser ---
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page()
@@ -93,10 +74,9 @@ async def _monitor_and_mint_async(
         print(f"[FrontendSniper] Membuka {url} …")
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-        mint_button = None
+        valid_buttons = []
         attempt = 0
 
-        # --- tight monitoring loop (1-2 detik interval) ---
         while True:
             attempt += 1
             try:
@@ -105,74 +85,35 @@ async def _monitor_and_mint_async(
                 await asyncio.sleep(1)
                 continue
 
-            # cari tombol yang mengandung keyword mint
             for keyword in _MINT_KEYWORDS:
                 locator = page.get_by_role("button", name=re.compile(keyword, re.IGNORECASE))
                 count = await locator.count()
-                if count == 0:
-                    continue
-                candidate = locator.first
-                # pastikan tombol tidak disabled
-                is_disabled = await candidate.is_disabled()
-                if is_disabled:
-                    print(
-                        f"[FrontendSniper] Tombol '{keyword}' ketemu tapi disabled, "
-                        f"attempt #{attempt}…"
-                    )
-                    continue
+                for i in range(count):
+                    candidate = locator.nth(i)
+                    is_disabled = await candidate.is_disabled()
+                    if not is_disabled:
+                        valid_buttons.append(candidate)
 
-                # tombol aktif ditemukan!
-                btn_text = await candidate.inner_text()
-                mint_button = candidate
-                print(
-                    f"[FrontendSniper] Liat nih boss, tombol udah nongol! "
-                    f"Teks: '{btn_text.strip()}' — Siap hajar."
-                )
-                break
-
-            if mint_button is not None:
+            if valid_buttons:
+                print(f"[FrontendSniper] BINGO! Ketemu {len(valid_buttons)} tombol potensial. Siap di-test satu per satu.")
                 break
 
             if attempt % 15 == 0:
-                print(
-                    f"[FrontendSniper] Masih nyari boss… attempt #{attempt}"
-                )
+                print(f"[FrontendSniper] Masih nyari boss… attempt #{attempt}")
 
             await asyncio.sleep(1.5)
-
-        # --- extract surrounding context for logging ---
-        try:
-            parent_text = await mint_button.evaluate(
-                "el => el.closest('section,div,main')?.innerText?.slice(0, 300) || ''"
-            )
-        except Exception:
-            parent_text = ""
-
-        print(f"[FrontendSniper] Konteks sekitar tombol:\n{parent_text[:300]}")
-
-        # --- broadcast mint txs via multi-wallet ---
-        # Inject mock window.ethereum provider to intercept dApp wallet calls
-        # and capture raw transaction payloads directly from the frontend.
 
         tx_hashes: list[str] = []
         failed_count = 0
         _capture_exposed = False
 
-        async def _click_mint_for_wallet(w: dict) -> dict | None:
-            """Inject mock ethereum provider, click mint, capture tx payload."""
+        async def _click_mint_for_wallet(w: dict) -> str | None:
             nonlocal _capture_exposed
+            captured: list[str] = []
 
-            captured: list[dict] = []
-
-            # expose Python callback so JS can send captured tx data
-            async def _capture_tx(payload: dict) -> None:
-                print(
-                    f"[FrontendSniper] 🎯 TX ditangkap dari wallet "
-                    f"{w['address'][:10]}…: {payload}"
-                )
+            async def _capture_tx(payload: str):
                 captured.append(payload)
 
-            # clean up previous expose if needed (multi-wallet iteration)
             if _capture_exposed:
                 try:
                     page.remove_listener("captureTx", lambda _: None)
@@ -183,9 +124,9 @@ async def _monitor_and_mint_async(
             await page.expose_function("captureTx", _capture_tx)
             _capture_exposed = True
 
-            # inject mock window.ethereum provider
             address = w["address"]
-            await page.add_init_script(f"""
+            
+            js_injection = f"""
                 window.ethereum = {{
                     isMetaMask: true,
                     request: async function({{ method, params }}) {{
@@ -196,133 +137,108 @@ async def _monitor_and_mint_async(
                             return '0x1';
                         }}
                         if (method === 'eth_sendTransaction') {{
-                            var txData = params[0];
-                            window.captureTx(JSON.stringify(txData));
-                            // return a dummy tx hash so the dApp doesn't hang
+                            window.captureTx(JSON.stringify(params[0]));
                             return '0x' + '0'.repeat(64);
                         }}
                         return null;
                     }}
                 }};
-            """)
-            # also run on current page (add_init_script only applies on next nav)
-            await page.evaluate(f"""
-                (() => {{
-                    window.ethereum = {{
-                        isMetaMask: true,
-                        request: async function({{ method, params }}) {{
-                            if (method === 'eth_requestAccounts' || method === 'eth_accounts') {{
-                                return ['{address}'];
-                            }}
-                            if (method === 'eth_chainId') {{
-                                return '0x1';
-                            }}
-                            if (method === 'eth_sendTransaction') {{
-                                var txData = params[0];
-                                window.captureTx(JSON.stringify(txData));
-                                return '0x' + '0'.repeat(64);
-                            }}
-                            return null;
-                        }}
-                    }};
-                }})()
-            """)
+            """
+            
+            await page.add_init_script(js_injection)
+            await page.evaluate(f"(() => {{ {js_injection} }})()")
 
-            print(
-                f"[FrontendSniper] Mock window.ethereum injected untuk "
-                f"wallet {w['index']} ({address[:10]}…)"
-            )
+            tx_data = None
+            for idx, btn in enumerate(valid_buttons):
+                captured.clear()
+                try:
+                    btn_text = await btn.inner_text()
+                    print(f"[FrontendSniper] Wallet {w['index']} ngeklik tombol '{btn_text.strip()}'...")
+                    await btn.click(timeout=5000)
+                    await asyncio.sleep(2.5)
+                    
+                    if captured:
+                        tx_data = json.loads(captured[0])
+                        print(f"[FrontendSniper] -> Payload tertangkap dari tombol '{btn_text.strip()}'!")
+                        break
+                    else:
+                        print(f"[FrontendSniper] -> Tombol '{btn_text.strip()}' zonk (gak ada payload). Lanjut...")
+                except Exception as e:
+                    print(f"[FrontendSniper] -> Gagal ngeklik tombol #{idx+1}: {e}")
+
+            if not tx_data:
+                print(f"[FrontendSniper] Wallet {w['index']}: Semua tombol diklik, tapi web gak ngirim payload sama sekali.")
+                return None
 
             try:
-                await mint_button.click()
-                # give dApp time to call eth_sendTransaction via the provider
-                await asyncio.sleep(3)
+                nonce = w3.eth.get_transaction_count(address)
+                value_hex = tx_data.get("value", "0x0")
+                value_int = int(value_hex, 16) if value_hex else 0
 
-                if captured:
-                    return {
-                        "wallet_index": w["index"],
-                        "wallet_address": address,
-                        "tx_payload": captured[0],
-                    }
-                return None
+                tx = {
+                    "from": address,
+                    "to": w3.to_checksum_address(tx_data.get("to")),
+                    "value": value_int,
+                    "data": tx_data.get("data", ""),
+                    "nonce": nonce,
+                    "chainId": 1,
+                }
+                
+                try:
+                    tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.2)
+                except Exception as e:
+                    print(f"[FrontendSniper] Estimate gas gagal, pakai fallback 300k: {e}")
+                    tx["gas"] = 300000
+
+                try:
+                    tx["maxFeePerGas"] = w3.eth.gas_price * 2
+                    tx["maxPriorityFeePerGas"] = w3.to_wei(1, "gwei")
+                except Exception:
+                    pass 
+
+                signed = w3.eth.account.sign_transaction(tx, w["private_key"])
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                print(f"[FrontendSniper] Wallet {w['index']} sukses on-chain! Hash: {tx_hash.hex()}")
+                return tx_hash.hex()
             except Exception as e:
-                print(f"[FrontendSniper] Wallet {w['index']} gagal click: {e}")
+                print(f"[FrontendSniper] Wallet {w['index']} gagal eksekusi on-chain: {e}")
                 return None
 
-        # jalankan semua wallet secara paralel
-        print(
-            f"[FrontendSniper] Broadcasting mint dari {len(wallets)} wallet "
-            f"secara paralel…"
-        )
-        results = await asyncio.gather(
-            *[_click_mint_for_wallet(w) for w in wallets],
-            return_exceptions=True,
-        )
-
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                failed_count += 1
-                print(
-                    f"[FrontendSniper] Wallet {wallets[idx]['index']} error: {result}"
-                )
-            elif result is None:
+        print(f"[FrontendSniper] Memulai infiltrasi dari {len(wallets)} wallet berurutan…")
+        
+        # Eksekusi berurutan agar injeksi JS tiap wallet tidak saling timpa
+        for w in wallets:
+            result = await _click_mint_for_wallet(w)
+            if result is None:
                 failed_count += 1
             else:
-                tx_hashes.append(
-                    f"wallet#{result['wallet_index']}: {result['tx_payload']}"
-                )
+                tx_hashes.append(str(result))
 
         await browser.close()
 
-    # --- build output ---
     if failed_count == 0 and tx_hashes:
-        hashes_str = " | ".join(tx_hashes)
-        return (
-            f"✅ Sukses boss!! {len(wallets)} wallet berhasil minting NFT. "
-            f"Berikut tx payload nya: [{hashes_str}]"
-        )
+        return f"✅ Sukses boss!! {len(wallets)} wallet menembus frontend. Hash: [{', '.join(tx_hashes)}]"
     elif tx_hashes:
-        hashes_str = " | ".join(tx_hashes)
-        return (
-            f"❌ Gagal boss!! Ada wallet yang gagal minting ({failed_count}/{len(wallets)}), "
-            f"kemungkinan karena revert/gas war. "
-            f"Berhasil: [{hashes_str}]"
-        )
+        return f"❌ Tembus sebagian boss!! Berhasil: [{', '.join(tx_hashes)}]"
     else:
-        return (
-            "❌ Gagal boss!! Semua wallet gagal minting, "
-            "kemungkinan karena revert/gas war."
-        )
-
+        return "❌ Gagal boss!! Semua wallet gagal nge-trigger transaksi atau revert."
 
 # ---------------------------------------------------------------------------
 # CrewAI Tool wrapper
 # ---------------------------------------------------------------------------
 
 @tool("Playwright Frontend Sniper")
-def playwright_frontend_sniper(
-    url: str,
-    target_time_spec: str = "",
-    wallet_count: int = 4,
-) -> str:
+def playwright_frontend_sniper(url: str, target_time_spec: str = "", wallet_count: int = 4) -> str:
     """
     Monitor a mint page using a headless browser and auto-mint when the button activates.
-
     Supports standby countdown and multi-wallet parallel execution.
-
     Args:
-        url: The mint page URL to monitor.
-        target_time_spec: When to start monitoring. Relative offset like
-            '+10m', '+1h', or absolute UTC time like '13:00 UTC'.
-            If omitted, monitoring starts immediately.
-        wallet_count: Number of wallets to use (reads PRIV_KEY_1…N from env).
-            Default 4.
+        url: The mint page URL.
+        target_time_spec: Relative offset like '+10m', '+1h', or UTC time.
+        wallet_count: Number of wallets to use.
     """
     loop = asyncio.new_event_loop()
     try:
-        result = loop.run_until_complete(
-            _monitor_and_mint_async(url, target_time_spec, wallet_count)
-        )
-        return result
+        return loop.run_until_complete(_monitor_and_mint_async(url, target_time_spec, wallet_count))
     finally:
         loop.close()
