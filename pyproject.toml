@@ -1,0 +1,45 @@
+[project]
+name = "web3-crew-ai"
+version = "0.1.0"
+description = "Autonomous Web3 Multi-Agent System using CrewAI for token analysis, smart contract auditing, and safe transaction execution."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+
+dependencies = [
+    "crewai[google-genai,litellm]>=0.108.0",
+    "crewai-tools>=0.49.0",
+    "web3>=7.0.0",
+    "pydantic-settings>=2.0.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "python-telegram-bot>=20.7",
+    "langchain-core>=1.4.0",
+    "playwright>=1.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/web3_crew"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
