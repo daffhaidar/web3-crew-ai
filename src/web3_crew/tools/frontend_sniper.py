@@ -10,7 +10,6 @@ import os
 import time
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
 
 from crewai.tools import tool
 from playwright.async_api import async_playwright
@@ -53,7 +52,7 @@ def _seconds_until(target_ts: float) -> float:
 
 async def _monitor_and_mint_async(
     url: str,
-    target_time_spec: Optional[str] = None,
+    target_time_spec: str = "",
     wallet_count: int = 4,
 ) -> str:
     # --- resolve wallets ---
@@ -241,7 +240,7 @@ async def _monitor_and_mint_async(
 @tool("Playwright Frontend Sniper")
 def playwright_frontend_sniper(
     url: str,
-    target_time_spec: Optional[str] = None,
+    target_time_spec: str = "",
     wallet_count: int = 4,
 ) -> str:
     """
