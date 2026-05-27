@@ -7,6 +7,7 @@ button activates, and then blast transactions from up to 4 wallets in parallel.
 from __future__ import annotations
 
 import os
+import re
 import time
 import asyncio
 from datetime import datetime, timezone
@@ -106,7 +107,7 @@ async def _monitor_and_mint_async(
 
             # cari tombol yang mengandung keyword mint
             for keyword in _MINT_KEYWORDS:
-                locator = page.get_by_role("button", name=lambda t: keyword in t.lower())
+                locator = page.get_by_role("button", name=re.compile(keyword, re.IGNORECASE))
                 count = await locator.count()
                 if count == 0:
                     continue
